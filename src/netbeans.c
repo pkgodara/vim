@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *			Netbeans integration by David Weatherford
@@ -473,7 +473,7 @@ nb_parse_cmd(char_u *cmd)
     {
 	buf_T	*buf;
 
-	for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+	FOR_ALL_BUFFERS(buf)
 	    buf->b_has_sign_column = FALSE;
 
 	/* The IDE is breaking the connection. */
@@ -721,7 +721,7 @@ count_changed_buffers(void)
     int		n;
 
     n = 0;
-    for (bufp = firstbuf; bufp != NULL; bufp = bufp->b_next)
+    FOR_ALL_BUFFERS(bufp)
 	if (bufp->b_changed)
 	    ++n;
     return n;
@@ -2156,7 +2156,7 @@ nb_do_cmd(
 	else if (streq((char *)cmd, "save"))
 	{
 	    /*
-	     * NOTE - This command is obsolete wrt NetBeans. Its left in
+	     * NOTE - This command is obsolete wrt NetBeans. It's left in
 	     * only for historical reasons.
 	     */
 	    if (buf == NULL || buf->bufp == NULL)
@@ -2242,7 +2242,7 @@ nb_do_cmd(
 
     /*
      * Is this needed? I moved the netbeans_Xt_connect() later during startup
-     * and it may no longer be necessary. If its not needed then needupdate
+     * and it may no longer be necessary. If it's not needed then needupdate
      * and do_update can also be removed.
      */
     if (buf != NULL && buf->initDone && do_update)
@@ -2332,7 +2332,8 @@ special_keys(char_u *args)
     char *save_str = nb_unquote(args, NULL);
     char *tok = strtok(save_str, " ");
     char *sep;
-    char keybuf[64];
+#define KEYBUFLEN 64
+    char keybuf[KEYBUFLEN];
     char cmdbuf[256];
 
     while (tok != NULL)
@@ -2359,10 +2360,13 @@ special_keys(char_u *args)
 	    tok++;
 	}
 
-	strcpy(&keybuf[i], tok);
-	vim_snprintf(cmdbuf, sizeof(cmdbuf),
-				"<silent><%s> :nbkey %s<CR>", keybuf, keybuf);
-	do_map(0, (char_u *)cmdbuf, NORMAL, FALSE);
+	if (strlen(tok) + i < KEYBUFLEN)
+	{
+	    strcpy(&keybuf[i], tok);
+	    vim_snprintf(cmdbuf, sizeof(cmdbuf),
+				 "<silent><%s> :nbkey %s<CR>", keybuf, keybuf);
+	    do_map(0, (char_u *)cmdbuf, NORMAL, FALSE);
+	}
 	tok = strtok(NULL, " ");
     }
     vim_free(save_str);
@@ -2856,7 +2860,7 @@ netbeans_unmodified(buf_T *bufp UNUSED)
 }
 
 /*
- * Send a button release event back to netbeans. Its up to netbeans
+ * Send a button release event back to netbeans. It's up to netbeans
  * to decide what to do (if anything) with this event.
  */
     void
@@ -3097,24 +3101,9 @@ netbeans_draw_multisign_indicator(int row)
 
 #if GTK_CHECK_VERSION(3,0,0)
     cr = cairo_create(gui.surface);
-    {
-	GdkVisual *visual = NULL;
-	guint32 r_mask, g_mask, b_mask;
-	gint r_shift, g_shift, b_shift;
-
-	visual = gdk_window_get_visual(gtk_widget_get_window(gui.drawarea));
-	if (visual != NULL)
-	{
-	    gdk_visual_get_red_pixel_details(visual, &r_mask, &r_shift, NULL);
-	    gdk_visual_get_green_pixel_details(visual, &g_mask, &g_shift, NULL);
-	    gdk_visual_get_blue_pixel_details(visual, &b_mask, &b_shift, NULL);
-
-	    cairo_set_source_rgb(cr,
-		    ((gui.fgcolor->red & r_mask) >> r_shift) / 255.0,
-		    ((gui.fgcolor->green & g_mask) >> g_shift) / 255.0,
-		    ((gui.fgcolor->blue & b_mask) >> b_shift) / 255.0);
-	}
-    }
+    cairo_set_source_rgba(cr,
+	    gui.fgcolor->red, gui.fgcolor->green, gui.fgcolor->blue,
+	    gui.fgcolor->alpha);
 #endif
 
     x = 0;
@@ -3468,7 +3457,7 @@ pos2off(buf_T *buf, pos_T *pos)
 
 
 /*
- * This message is printed after NetBeans opens a new file. Its
+ * This message is printed after NetBeans opens a new file. It's
  * similar to the message readfile() uses, but since NetBeans
  * doesn't normally call readfile, we do our own.
  */

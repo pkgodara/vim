@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -12,6 +12,7 @@
  */
 
 #define MESSAGE_FILE		/* don't include prototype for smsg() */
+#define USING_FLOAT_STUFF
 
 #include "vim.h"
 
@@ -40,6 +41,9 @@ static char_u *msg_show_console_dialog(char_u *message, char_u *buttons, int dfl
 static int	confirm_msg_used = FALSE;	/* displaying confirm_msg */
 static char_u	*confirm_msg = NULL;		/* ":confirm" message */
 static char_u	*confirm_msg_tail;		/* tail of confirm_msg */
+#endif
+#ifdef FEAT_JOB_CHANNEL
+static int emsg_to_channel_log = FALSE;
 #endif
 
 struct msg_hist
@@ -137,6 +141,11 @@ msg_attr_keep(
     int		retval;
     char_u	*buf = NULL;
 
+    /* Skip messages not matching ":filter pattern".
+     * Don't filter when there is an error. */
+    if (!emsg_on_display && message_filtered(s))
+	return TRUE;
+
 #ifdef FEAT_EVAL
     if (attr == 0)
 	set_vim_var_string(VV_STATUSMSG, s, -1);
@@ -159,6 +168,14 @@ msg_attr_keep(
 		&& last_msg_hist->msg != NULL
 		&& STRCMP(s, last_msg_hist->msg)))
 	add_msg_hist(s, -1, attr);
+
+#ifdef FEAT_JOB_CHANNEL
+    if (emsg_to_channel_log)
+    {
+	/* Write message in the channel log. */
+	ch_logs(NULL, "ERROR: %s", (char *)s);
+    }
+#endif
 
     /* When displaying keep_msg, don't let msg_start() free it, caller must do
      * that. */
@@ -237,18 +254,19 @@ msg_strtrunc(
 trunc_string(
     char_u	*s,
     char_u	*buf,
-    int		room,
+    int		room_in,
     int		buflen)
 {
-    int		half;
-    int		len;
+    size_t	room = room_in - 3; /* "..." takes 3 chars */
+    size_t	half;
+    size_t	len = 0;
     int		e;
     int		i;
     int		n;
 
-    room -= 3;
+    if (room_in < 3)
+	room = 0;
     half = room / 2;
-    len = 0;
 
     /* First part: Start of the string. */
     for (e = 0; len < half && e < buflen; ++e)
@@ -298,12 +316,12 @@ trunc_string(
 	{
 	    do
 		half = half - (*mb_head_off)(s, s + half - 1) - 1;
-	    while (utf_iscomposing(utf_ptr2char(s + half)) && half > 0);
+	    while (half > 0 && utf_iscomposing(utf_ptr2char(s + half)));
 	    n = ptr2cells(s + half);
-	    if (len + n > room)
+	    if (len + n > room || half == 0)
 		break;
 	    len += n;
-	    i = half;
+	    i = (int)half;
 	}
     }
     else
@@ -320,7 +338,7 @@ trunc_string(
 	if (s != buf)
 	{
 	    len = STRLEN(s);
-	    if (len >= buflen)
+	    if (len >= (size_t)buflen)
 		len = buflen - 1;
 	    len = len - e + 1;
 	    if (len < 1)
@@ -333,8 +351,8 @@ trunc_string(
     {
 	/* set the middle and copy the last part */
 	mch_memmove(buf + e, "...", (size_t)3);
-	len = (int)STRLEN(s + i) + 1;
-	if (len >= buflen - e - 3)
+	len = STRLEN(s + i) + 1;
+	if (len >= (size_t)buflen - e - 3)
 	    len = buflen - e - 3 - 1;
 	mch_memmove(buf + e + 3, s + i, len);
 	buf[e + 3 + len - 1] = NUL;
@@ -521,6 +539,21 @@ emsg_not_now(void)
     return FALSE;
 }
 
+#if !defined(HAVE_STRERROR) || defined(PROTO)
+/*
+ * Replacement for perror() that behaves more or less like emsg() was called.
+ * v:errmsg will be set and called_emsg will be set.
+ */
+    void
+do_perror(char *msg)
+{
+    perror(msg);
+    ++emsg_silent;
+    emsg((char_u *)msg);
+    --emsg_silent;
+}
+#endif
+
 /*
  * emsg() - display an error message
  *
@@ -534,6 +567,7 @@ emsg(char_u *s)
 {
     int		attr;
     char_u	*p;
+    int		r;
 #ifdef FEAT_EVAL
     int		ignore = FALSE;
     int		severe;
@@ -544,8 +578,6 @@ emsg(char_u *s)
 	return TRUE;
 
     called_emsg = TRUE;
-    if (emsg_silent == 0)
-	ex_exitval = 1;
 
     /*
      * If "emsg_severe" is TRUE: When an error exception is to be thrown,
@@ -602,8 +634,13 @@ emsg(char_u *s)
 		}
 		redir_write(s, -1);
 	    }
+#ifdef FEAT_JOB_CHANNEL
+	    ch_logs(NULL, "ERROR: %s", (char *)s);
+#endif
 	    return TRUE;
 	}
+
+	ex_exitval = 1;
 
 	/* Reset msg_silent, an error causes messages to be switched back on. */
 	msg_silent = 0;
@@ -628,6 +665,9 @@ emsg(char_u *s)
 				     * and a redraw is expected because
 				     * msg_scrolled is non-zero */
 
+#ifdef FEAT_JOB_CHANNEL
+    emsg_to_channel_log = TRUE;
+#endif
     /*
      * Display name and line number for the source of the error.
      */
@@ -637,8 +677,14 @@ emsg(char_u *s)
      * Display the error message itself.
      */
     msg_nowait = FALSE;			/* wait for this msg */
-    return msg_attr(s, attr);
+    r = msg_attr(s, attr);
+
+#ifdef FEAT_JOB_CHANNEL
+    emsg_to_channel_log = FALSE;
+#endif
+    return r;
 }
+
 
 /*
  * Print an error message with one "%s" and one string argument.
@@ -647,6 +693,84 @@ emsg(char_u *s)
 emsg2(char_u *s, char_u *a1)
 {
     return emsg3(s, a1, NULL);
+}
+
+/*
+ * Print an error message with one or two "%s" and one or two string arguments.
+ * This is not in message.c to avoid a warning for prototypes.
+ */
+    int
+emsg3(char_u *s, char_u *a1, char_u *a2)
+{
+    if (emsg_not_now())
+	return TRUE;		/* no error messages at the moment */
+    vim_snprintf((char *)IObuff, IOSIZE, (char *)s, a1, a2);
+    return emsg(IObuff);
+}
+
+/*
+ * Print an error message with one "%ld" and one long int argument.
+ * This is not in message.c to avoid a warning for prototypes.
+ */
+    int
+emsgn(char_u *s, long n)
+{
+    if (emsg_not_now())
+	return TRUE;		/* no error messages at the moment */
+    vim_snprintf((char *)IObuff, IOSIZE, (char *)s, n);
+    return emsg(IObuff);
+}
+
+/*
+ * Same as emsg(...), but abort on error when ABORT_ON_INTERNAL_ERROR is
+ * defined. It is used for internal errors only, so that they can be
+ * detected when fuzzing vim.
+ */
+    void
+iemsg(char_u *s)
+{
+    msg(s);
+#ifdef ABORT_ON_INTERNAL_ERROR
+    abort();
+#endif
+}
+
+
+/*
+ * Same as emsg2(...) but abort on error when ABORT_ON_INTERNAL_ERROR is
+ * defined. It is used for internal errors only, so that they can be
+ * detected when fuzzing vim.
+ */
+    void
+iemsg2(char_u *s, char_u *a1)
+{
+    emsg2(s, a1);
+#ifdef ABORT_ON_INTERNAL_ERROR
+    abort();
+#endif
+}
+
+/*
+ * Same as emsgn(...) but abort on error when ABORT_ON_INTERNAL_ERROR is
+ * defined. It is used for internal errors only, so that they can be
+ * detected when fuzzing vim.
+ */
+    void
+iemsgn(char_u *s, long n)
+{
+    emsgn(s, n);
+#ifdef ABORT_ON_INTERNAL_ERROR
+    abort();
+#endif
+}
+
+/*
+ * Give an "Internal error" message.
+ */
+    void
+internal_error(char *where)
+{
+    IEMSG2(_(e_intern2), where);
 }
 
 /* emsg3() and emsgn() are in misc2.c to avoid warnings for the prototypes. */
@@ -1793,7 +1917,7 @@ screen_puts_mbyte(char_u *s, int l, int attr)
     void
 msg_puts(char_u *s)
 {
- msg_puts_attr(s, 0);
+    msg_puts_attr(s, 0);
 }
 
     void
@@ -2134,6 +2258,21 @@ msg_puts_display(
 }
 
 /*
+ * Return TRUE when ":filter pattern" was used and "msg" does not match
+ * "pattern".
+ */
+    int
+message_filtered(char_u *msg)
+{
+    int match;
+
+    if (cmdmod.filter_regmatch.regprog == NULL)
+	return FALSE;
+    match = vim_regexec(&cmdmod.filter_regmatch, msg, (colnr_T)0);
+    return cmdmod.filter_force ? match : !match;
+}
+
+/*
  * Scroll the screen up one line for displaying the next message line.
  */
     static void
@@ -2425,7 +2564,7 @@ msg_puts_printf(char_u *str, int maxlen)
     if (!(silent_mode && p_verbose == 0))
 	mch_settmode(TMODE_COOK);	/* handle '\r' and '\n' correctly */
 #endif
-    while (*s != NUL && (maxlen < 0 || (int)(s - str) < maxlen))
+    while ((maxlen < 0 || (int)(s - str) < maxlen) && *s != NUL)
     {
 	if (!(silent_mode && p_verbose == 0))
 	{
@@ -3871,7 +4010,7 @@ do_browse(
 static char *e_printf = N_("E766: Insufficient arguments for printf()");
 
 static varnumber_T tv_nr(typval_T *tvs, int *idxp);
-static char *tv_str(typval_T *tvs, int *idxp);
+static char *tv_str(typval_T *tvs, int *idxp, char_u **tofree);
 # ifdef FEAT_FLOAT
 static double tv_float(typval_T *tvs, int *idxp);
 # endif
@@ -3900,20 +4039,28 @@ tv_nr(typval_T *tvs, int *idxp)
 
 /*
  * Get string argument from "idxp" entry in "tvs".  First entry is 1.
+ * If "tofree" is NULL get_tv_string_chk() is used.  Some types (e.g. List)
+ * are not converted to a string.
+ * If "tofree" is not NULL echo_string() is used.  All types are converted to
+ * a string with the same format as ":echo".  The caller must free "*tofree".
  * Returns NULL for an error.
  */
     static char *
-tv_str(typval_T *tvs, int *idxp)
+tv_str(typval_T *tvs, int *idxp, char_u **tofree)
 {
-    int		idx = *idxp - 1;
-    char	*s = NULL;
+    int		    idx = *idxp - 1;
+    char	    *s = NULL;
+    static char_u   numbuf[NUMBUFLEN];
 
     if (tvs[idx].v_type == VAR_UNKNOWN)
 	EMSG(_(e_printf));
     else
     {
 	++*idxp;
-	s = (char *)get_tv_string_chk(&tvs[idx]);
+	if (tofree != NULL)
+	    s = (char *)echo_string(&tvs[idx], tofree, numbuf, get_copyID());
+	else
+	    s = (char *)get_tv_string_chk(&tvs[idx]);
     }
     return s;
 }
@@ -3945,6 +4092,30 @@ tv_float(typval_T *tvs, int *idxp)
 # endif
 #endif
 
+#ifdef FEAT_FLOAT
+/*
+ * Return the representation of infinity for printf() function:
+ * "-inf", "inf", "+inf", " inf", "-INF", "INF", "+INF" or " INF".
+ */
+    static const char *
+infinity_str(int positive,
+	     char fmt_spec,
+	     int force_sign,
+	     int space_for_positive)
+{
+    static const char *table[] =
+    {
+	"-inf", "inf", "+inf", " inf",
+	"-INF", "INF", "+INF", " INF"
+    };
+    int idx = positive * (1 + force_sign + force_sign * space_for_positive);
+
+    if (ASCII_ISUPPER(fmt_spec))
+	idx += 4;
+    return table[idx];
+}
+#endif
+
 /*
  * This code was included to provide a portable vsnprintf() and snprintf().
  * Some systems may provide their own, but we always use this one for
@@ -3961,10 +4132,10 @@ tv_float(typval_T *tvs, int *idxp)
  * with flags: '-', '+', ' ', '0' and '#'.
  * An asterisk is supported for field width as well as precision.
  *
- * Limited support for floating point was added: 'f', 'e', 'E', 'g', 'G'.
+ * Limited support for floating point was added: 'f', 'F', 'e', 'E', 'g', 'G'.
  *
- * Length modifiers 'h' (short int) and 'l' (long int) are supported.
- * 'll' (long long int) is not supported.
+ * Length modifiers 'h' (short int) and 'l' (long int) and 'll' (long long int)
+ * are supported.
  *
  * The locale is not used, the string is used as a byte string.  This is only
  * relevant for double-byte encodings where the second byte may be '%'.
@@ -4067,12 +4238,14 @@ vim_vsnprintf(
 	    char    length_modifier = '\0';
 
 	    /* temporary buffer for simple numeric->string conversion */
-# ifdef FEAT_FLOAT
+# if defined(FEAT_FLOAT)
 #  define TMP_LEN 350	/* On my system 1e308 is the biggest number possible.
 			 * That sounds reasonable to use as the maximum
 			 * printable. */
+# elif defined(FEAT_NUM64)
+#  define TMP_LEN 66
 # else
-#  define TMP_LEN 32
+#  define TMP_LEN 34
 # endif
 	    char    tmp[TMP_LEN];
 
@@ -4096,6 +4269,10 @@ vim_vsnprintf(
 
 	    /* current conversion specifier character */
 	    char    fmt_spec = '\0';
+
+	    /* buffer for 's' and 'S' specs */
+	    char_u  *tofree = NULL;
+
 
 	    str_arg = NULL;
 	    p++;  /* skip '%' */
@@ -4211,7 +4388,6 @@ vim_vsnprintf(
 		case 'D': fmt_spec = 'd'; length_modifier = 'l'; break;
 		case 'U': fmt_spec = 'u'; length_modifier = 'l'; break;
 		case 'O': fmt_spec = 'o'; length_modifier = 'l'; break;
-		case 'F': fmt_spec = 'f'; break;
 		default: break;
 	    }
 
@@ -4260,7 +4436,7 @@ vim_vsnprintf(
 		case 'S':
 		    str_arg =
 # if defined(FEAT_EVAL)
-				tvs != NULL ? tv_str(tvs, &arg_idx) :
+				tvs != NULL ? tv_str(tvs, &arg_idx, &tofree) :
 # endif
 				    va_arg(ap, char *);
 		    if (str_arg == NULL)
@@ -4315,9 +4491,13 @@ vim_vsnprintf(
 		}
 		break;
 
-	    case 'd': case 'u': case 'o': case 'x': case 'X': case 'p':
+	    case 'd': case 'u':
+	    case 'b': case 'B':
+	    case 'o':
+	    case 'x': case 'X':
+	    case 'p':
 		{
-		    /* NOTE: the u, o, x, X and p conversion specifiers
+		    /* NOTE: the u, b, o, x, X and p conversion specifiers
 		     * imply the value is unsigned;  d implies a signed
 		     * value */
 
@@ -4342,6 +4522,9 @@ vim_vsnprintf(
 		    uvarnumber_T ullong_arg = 0;
 # endif
 
+		    /* only defined for b conversion */
+		    uvarnumber_T bin_arg = 0;
+
 		    /* pointer argument value -only defined for p
 		     * conversion */
 		    void *ptr_arg = NULL;
@@ -4351,10 +4534,22 @@ vim_vsnprintf(
 			length_modifier = '\0';
 			ptr_arg =
 # if defined(FEAT_EVAL)
-				 tvs != NULL ? (void *)tv_str(tvs, &arg_idx) :
+				 tvs != NULL ? (void *)tv_str(tvs, &arg_idx,
+									NULL) :
 # endif
 					va_arg(ap, void *);
 			if (ptr_arg != NULL)
+			    arg_sign = 1;
+		    }
+		    else if (fmt_spec == 'b' || fmt_spec == 'B')
+		    {
+			bin_arg =
+# if defined(FEAT_EVAL)
+				    tvs != NULL ?
+					   (uvarnumber_T)tv_nr(tvs, &arg_idx) :
+# endif
+					va_arg(ap, uvarnumber_T);
+			if (bin_arg != 0)
 			    arg_sign = 1;
 		    }
 		    else if (fmt_spec == 'd')
@@ -4463,7 +4658,8 @@ vim_vsnprintf(
 		    else if (alternate_form)
 		    {
 			if (arg_sign != 0
-				     && (fmt_spec == 'x' || fmt_spec == 'X') )
+				     && (fmt_spec == 'b' || fmt_spec == 'B'
+				      || fmt_spec == 'x' || fmt_spec == 'X') )
 			{
 			    tmp[str_arg_l++] = '0';
 			    tmp[str_arg_l++] = fmt_spec;
@@ -4479,7 +4675,7 @@ vim_vsnprintf(
 		    {
 			/* When zero value is formatted with an explicit
 			 * precision 0, the resulting formatted string is
-			 * empty (d, i, u, o, x, X, p).   */
+			 * empty (d, i, u, b, B, o, x, X, p).   */
 		    }
 		    else
 		    {
@@ -4512,6 +4708,22 @@ vim_vsnprintf(
 
 			if (fmt_spec == 'p')
 			    str_arg_l += sprintf(tmp + str_arg_l, f, ptr_arg);
+			else if (fmt_spec == 'b' || fmt_spec == 'B')
+			{
+			    char	    b[8 * sizeof(uvarnumber_T)];
+			    size_t	    b_l = 0;
+			    uvarnumber_T    bn = bin_arg;
+
+			    do
+			    {
+				b[sizeof(b) - ++b_l] = '0' + (bn & 0x1);
+				bn >>= 1;
+			    }
+			    while (bn != 0);
+
+			    memcpy(tmp + str_arg_l, b + sizeof(b) - b_l, b_l);
+			    str_arg_l += b_l;
+			}
 			else if (fmt_spec == 'd')
 			{
 			    /* signed */
@@ -4604,6 +4816,7 @@ vim_vsnprintf(
 
 # ifdef FEAT_FLOAT
 	    case 'f':
+	    case 'F':
 	    case 'e':
 	    case 'E':
 	    case 'g':
@@ -4629,13 +4842,13 @@ vim_vsnprintf(
 			 * "1.0" as "1", we don't want that. */
 			if ((abs_f >= 0.001 && abs_f < 10000000.0)
 							      || abs_f == 0.0)
-			    fmt_spec = 'f';
+			    fmt_spec = ASCII_ISUPPER(fmt_spec) ? 'F' : 'f';
 			else
 			    fmt_spec = fmt_spec == 'g' ? 'e' : 'E';
 			remove_trailing_zeroes = TRUE;
 		    }
 
-		    if (fmt_spec == 'f' &&
+		    if ((fmt_spec == 'f' || fmt_spec == 'F') &&
 #  ifdef VAX
 			    abs_f > 1.0e38
 #  else
@@ -4644,28 +4857,53 @@ vim_vsnprintf(
 			    )
 		    {
 			/* Avoid a buffer overflow */
-			strcpy(tmp, "inf");
-			str_arg_l = 3;
+			STRCPY(tmp, infinity_str(f > 0.0, fmt_spec,
+					      force_sign, space_for_positive));
+			str_arg_l = STRLEN(tmp);
+			zero_padding = 0;
 		    }
 		    else
 		    {
-			format[0] = '%';
-			l = 1;
-			if (precision_specified)
+			if (isnan(f))
 			{
-			    size_t max_prec = TMP_LEN - 10;
-
-			    /* Make sure we don't get more digits than we
-			     * have room for. */
-			    if (fmt_spec == 'f' && abs_f > 1.0)
-				max_prec -= (size_t)log10(abs_f);
-			    if (precision > max_prec)
-				precision = max_prec;
-			    l += sprintf(format + 1, ".%d", (int)precision);
+			    /* Not a number: nan or NAN */
+			    STRCPY(tmp, ASCII_ISUPPER(fmt_spec) ? "NAN"
+								      : "nan");
+			    str_arg_l = 3;
+			    zero_padding = 0;
 			}
-			format[l] = fmt_spec;
-			format[l + 1] = NUL;
-			str_arg_l = sprintf(tmp, format, f);
+			else if (isinf(f))
+			{
+			    STRCPY(tmp, infinity_str(f > 0.0, fmt_spec,
+					      force_sign, space_for_positive));
+			    str_arg_l = STRLEN(tmp);
+			    zero_padding = 0;
+			}
+			else
+                        {
+			    /* Regular float number */
+			    format[0] = '%';
+			    l = 1;
+			    if (force_sign)
+				format[l++] = space_for_positive ? ' ' : '+';
+			    if (precision_specified)
+			    {
+				size_t max_prec = TMP_LEN - 10;
+
+				/* Make sure we don't get more digits than we
+				 * have room for. */
+				if ((fmt_spec == 'f' || fmt_spec == 'F')
+								&& abs_f > 1.0)
+				    max_prec -= (size_t)log10(abs_f);
+				if (precision > max_prec)
+				    precision = max_prec;
+				l += sprintf(format + l, ".%d", (int)precision);
+			    }
+			    format[l] = fmt_spec == 'F' ? 'f' : fmt_spec;
+			    format[l + 1] = NUL;
+
+			    str_arg_l = sprintf(tmp, format, f);
+                        }
 
 			if (remove_trailing_zeroes)
 			{
@@ -4673,7 +4911,7 @@ vim_vsnprintf(
 			    char *tp;
 
 			    /* Using %g or %G: remove superfluous zeroes. */
-			    if (fmt_spec == 'f')
+			    if (fmt_spec == 'f' || fmt_spec == 'F')
 				tp = tmp + str_arg_l - 1;
 			    else
 			    {
@@ -4729,6 +4967,13 @@ vim_vsnprintf(
 				--str_arg_l;
 			    }
 			}
+		    }
+		    if (zero_padding && min_field_width > str_arg_l
+					      && (tmp[0] == '-' || force_sign))
+		    {
+			/* padding 0's should be inserted after the sign */
+			number_of_zeros_to_pad = min_field_width - str_arg_l;
+			zero_padding_insertion_ind = 1;
 		    }
 		    str_arg = tmp;
 		    break;
@@ -4861,6 +5106,7 @@ vim_vsnprintf(
 		    str_l += pn;
 		}
 	    }
+	    vim_free(tofree);
 	}
     }
 

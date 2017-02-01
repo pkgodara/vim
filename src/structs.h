@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -92,8 +92,7 @@ typedef struct {
 # ifdef FEAT_XCLIPBOARD
 #  include <X11/Intrinsic.h>
 # endif
-# define guicolor_T long_u		/* avoid error in prototypes and
-					 * make FEAT_TERMGUICOLORS work */
+# define guicolor_T long
 # define INVALCOLOR ((guicolor_T)0x1ffffff)
 #endif
 
@@ -262,6 +261,10 @@ typedef struct
 # define w_p_crb w_onebuf_opt.wo_crb	/* 'cursorbind' */
     int		wo_crb_save;	/* 'cursorbind' state saved for diff mode*/
 # define w_p_crb_save w_onebuf_opt.wo_crb_save
+#endif
+#ifdef FEAT_SIGNS
+    char_u	*wo_scl;
+# define w_p_scl w_onebuf_opt.wo_scl	/* 'signcolumn' */
 #endif
 
 #ifdef FEAT_EVAL
@@ -568,6 +571,8 @@ typedef struct
 # ifdef FEAT_AUTOCMD
     char_u	*save_ei;		/* saved value of 'eventignore' */
 # endif
+    regmatch_T	filter_regmatch;	/* set by :filter /pat/ */
+    int		filter_force;		/* set for :filter! */
 } cmdmod_T;
 
 #define MF_SEED_LEN	8
@@ -810,26 +815,29 @@ struct msglist
 };
 
 /*
+ * The exception types.
+ */
+typedef enum
+{
+    ET_USER,		/* exception caused by ":throw" command */
+    ET_ERROR,		/* error exception */
+    ET_INTERRUPT	/* interrupt exception triggered by Ctrl-C */
+} except_type_T;
+
+/*
  * Structure describing an exception.
  * (don't use "struct exception", it's used by the math library).
  */
 typedef struct vim_exception except_T;
 struct vim_exception
 {
-    int			type;		/* exception type */
+    except_type_T	type;		/* exception type */
     char_u		*value;		/* exception value */
     struct msglist	*messages;	/* message(s) causing error exception */
     char_u		*throw_name;	/* name of the throw point */
     linenr_T		throw_lnum;	/* line number of the throw point */
     except_T		*caught;	/* next exception on the caught stack */
 };
-
-/*
- * The exception types.
- */
-#define ET_USER		0	/* exception caused by ":throw" command */
-#define ET_ERROR	1	/* error exception */
-#define ET_INTERRUPT	2	/* interrupt exception triggered by Ctrl-C */
 
 /*
  * Structure to save the error/interrupt/exception state between calls to
@@ -925,8 +933,8 @@ typedef struct attr_entry
 	    short_u	    fg_color;	/* foreground color number */
 	    short_u	    bg_color;	/* background color number */
 # ifdef FEAT_TERMGUICOLORS
-	    long_u	    fg_rgb;	/* foreground color RGB */
-	    long_u	    bg_rgb;	/* background color RGB */
+	    guicolor_T	    fg_rgb;	/* foreground color RGB */
+	    guicolor_T	    bg_rgb;	/* background color RGB */
 # endif
 	} cterm;
 # ifdef FEAT_GUI
@@ -1122,23 +1130,46 @@ typedef long_u hash_T;		/* Type for hi_hash */
 #ifdef FEAT_NUM64
 /* Use 64-bit Number. */
 # ifdef WIN3264
+#  ifdef PROTO
+typedef long		    varnumber_T;
+typedef unsigned long	    uvarnumber_T;
+#define VARNUM_MIN	    LONG_MIN
+#define VARNUM_MAX	    LONG_MAX
+#define UVARNUM_MAX	    ULONG_MAX
+#  else
 typedef __int64		    varnumber_T;
 typedef unsigned __int64    uvarnumber_T;
+#define VARNUM_MIN	    _I64_MIN
+#define VARNUM_MAX	    _I64_MAX
+#define UVARNUM_MAX	    _UI64_MAX
+#  endif
 # elif defined(HAVE_STDINT_H)
 typedef int64_t		    varnumber_T;
 typedef uint64_t	    uvarnumber_T;
+#define VARNUM_MIN	    INT64_MIN
+#define VARNUM_MAX	    INT64_MAX
+#define UVARNUM_MAX	    UINT64_MAX
 # else
 typedef long		    varnumber_T;
 typedef unsigned long	    uvarnumber_T;
+#define VARNUM_MIN	    LONG_MIN
+#define VARNUM_MAX	    LONG_MAX
+#define UVARNUM_MAX	    ULONG_MAX
 # endif
 #else
 /* Use 32-bit Number. */
 # if VIM_SIZEOF_INT <= 3	/* use long if int is smaller than 32 bits */
 typedef long		    varnumber_T;
 typedef unsigned long	    uvarnumber_T;
+#define VARNUM_MIN	    LONG_MIN
+#define VARNUM_MAX	    LONG_MAX
+#define UVARNUM_MAX	    ULONG_MAX
 # else
 typedef int		    varnumber_T;
 typedef unsigned int	    uvarnumber_T;
+#define VARNUM_MIN	    INT_MIN
+#define VARNUM_MAX	    INT_MAX
+#define UVARNUM_MAX	    UINT_MAX
 # endif
 #endif
 
@@ -1245,6 +1276,14 @@ struct listvar_S
 };
 
 /*
+ * Static list with 10 items.  Use init_static_list() to initialize.
+ */
+typedef struct {
+    list_T	sl_list;	/* must be first */
+    listitem_T	sl_items[10];
+} staticList10_T;
+
+/*
  * Structure to hold an item of a Dictionary.
  * Also used for a variable.
  * The key is copied into "di_key" to avoid an extra alloc/free for it.
@@ -1287,10 +1326,112 @@ struct dictvar_S
     dict_T	*dv_used_prev;	/* previous dict in used dicts list */
 };
 
+#if defined(FEAT_EVAL) || defined(PROTO)
+typedef struct funccall_S funccall_T;
+
+/*
+ * Structure to hold info for a user function.
+ */
+typedef struct
+{
+    int		uf_varargs;	/* variable nr of arguments */
+    int		uf_flags;
+    int		uf_calls;	/* nr of active calls */
+    garray_T	uf_args;	/* arguments */
+    garray_T	uf_lines;	/* function lines */
+#ifdef FEAT_PROFILE
+    int		uf_profiling;	/* TRUE when func is being profiled */
+    /* profiling the function as a whole */
+    int		uf_tm_count;	/* nr of calls */
+    proftime_T	uf_tm_total;	/* time spent in function + children */
+    proftime_T	uf_tm_self;	/* time spent in function itself */
+    proftime_T	uf_tm_children;	/* time spent in children this call */
+    /* profiling the function per line */
+    int		*uf_tml_count;	/* nr of times line was executed */
+    proftime_T	*uf_tml_total;	/* time spent in a line + children */
+    proftime_T	*uf_tml_self;	/* time spent in a line itself */
+    proftime_T	uf_tml_start;	/* start time for current line */
+    proftime_T	uf_tml_children; /* time spent in children for this line */
+    proftime_T	uf_tml_wait;	/* start wait time for current line */
+    int		uf_tml_idx;	/* index of line being timed; -1 if none */
+    int		uf_tml_execed;	/* line being timed was executed */
+#endif
+    scid_T	uf_script_ID;	/* ID of script where function was defined,
+				   used for s: variables */
+    int		uf_refcount;	/* reference count, see func_name_refcount() */
+    funccall_T	*uf_scoped;	/* l: local variables for closure */
+    char_u	uf_name[1];	/* name of function (actually longer); can
+				   start with <SNR>123_ (<SNR> is K_SPECIAL
+				   KS_EXTRA KE_SNR) */
+} ufunc_T;
+
+#define MAX_FUNC_ARGS	20	/* maximum number of function arguments */
+#define VAR_SHORT_LEN	20	/* short variable name length */
+#define FIXVAR_CNT	12	/* number of fixed variables */
+
+/* structure to hold info for a function that is currently being executed. */
+struct funccall_S
+{
+    ufunc_T	*func;		/* function being called */
+    int		linenr;		/* next line to be executed */
+    int		returned;	/* ":return" used */
+    struct			/* fixed variables for arguments */
+    {
+	dictitem_T	var;		/* variable (without room for name) */
+	char_u	room[VAR_SHORT_LEN];	/* room for the name */
+    } fixvar[FIXVAR_CNT];
+    dict_T	l_vars;		/* l: local function variables */
+    dictitem_T	l_vars_var;	/* variable for l: scope */
+    dict_T	l_avars;	/* a: argument variables */
+    dictitem_T	l_avars_var;	/* variable for a: scope */
+    list_T	l_varlist;	/* list for a:000 */
+    listitem_T	l_listitems[MAX_FUNC_ARGS];	/* listitems for a:000 */
+    typval_T	*rettv;		/* return value */
+    linenr_T	breakpoint;	/* next line with breakpoint or zero */
+    int		dbg_tick;	/* debug_tick when breakpoint was set */
+    int		level;		/* top nesting level of executed function */
+#ifdef FEAT_PROFILE
+    proftime_T	prof_child;	/* time spent in a child */
+#endif
+    funccall_T	*caller;	/* calling function or NULL */
+
+    /* for closure */
+    int		fc_refcount;	/* number of user functions that reference this
+				 * funccal */
+    int		fc_copyID;	/* for garbage collection */
+    garray_T	fc_funcs;	/* list of ufunc_T* which keep a reference to
+				 * "func" */
+};
+
+/*
+ * Struct used by trans_function_name()
+ */
+typedef struct
+{
+    dict_T	*fd_dict;	/* Dictionary used */
+    char_u	*fd_newkey;	/* new key in "dict" in allocated memory */
+    dictitem_T	*fd_di;		/* Dictionary item used */
+} funcdict_T;
+
+#else
+/* dummy typedefs for function prototypes */
+typedef struct
+{
+    int	    dummy;
+} ufunc_T;
+typedef struct
+{
+    int	    dummy;
+} funcdict_T;
+#endif
+
 struct partial_S
 {
     int		pt_refcount;	/* reference count */
-    char_u	*pt_name;	/* function name */
+    char_u	*pt_name;	/* function name; when NULL use
+				 * pt_func->uf_name */
+    ufunc_T	*pt_func;	/* function pointer; when NULL lookup function
+				 * with pt_name */
     int		pt_auto;	/* when TRUE the partial was created for using
 				   dict.member in handle_subscript() */
     int		pt_argc;	/* number of arguments */
@@ -1298,11 +1439,13 @@ struct partial_S
     dict_T	*pt_dict;	/* dict for "self" */
 };
 
+/* Status of a job.  Order matters! */
 typedef enum
 {
     JOB_FAILED,
     JOB_STARTED,
-    JOB_ENDED
+    JOB_ENDED,	    /* detected job done */
+    JOB_FINISHED    /* job done and cleanup done */
 } jobstatus_T;
 
 /*
@@ -1349,6 +1492,7 @@ struct jsonq_S
     typval_T	*jq_value;
     jsonq_T	*jq_next;
     jsonq_T	*jq_prev;
+    int		jq_no_callback; /* TRUE when no callback was found */
 };
 
 struct cbq_S
@@ -1379,19 +1523,21 @@ typedef enum {
 
 /* Ordering matters, it is used in for loops: IN is last, only SOCK/OUT/ERR
  * are polled. */
-#define PART_SOCK   0
+typedef enum {
+    PART_SOCK = 0,
 #define CH_SOCK_FD	ch_part[PART_SOCK].ch_fd
-
 #ifdef FEAT_JOB_CHANNEL
-# define INVALID_FD  (-1)
-
-# define PART_OUT   1
-# define PART_ERR   2
-# define PART_IN    3
+    PART_OUT,
 # define CH_OUT_FD	ch_part[PART_OUT].ch_fd
+    PART_ERR,
 # define CH_ERR_FD	ch_part[PART_ERR].ch_fd
+    PART_IN,
 # define CH_IN_FD	ch_part[PART_IN].ch_fd
 #endif
+    PART_COUNT
+} ch_part_T;
+
+#define INVALID_FD	(-1)
 
 /* The per-fd info for a channel. */
 typedef struct {
@@ -1446,14 +1592,14 @@ struct channel_S {
     int		ch_id;		/* ID of the channel */
     int		ch_last_msg_id;	/* ID of the last message */
 
-    chanpart_T	ch_part[4];	/* info for socket, out, err and in */
+    chanpart_T	ch_part[PART_COUNT]; /* info for socket, out, err and in */
 
     char	*ch_hostname;	/* only for socket, allocated */
     int		ch_port;	/* only for socket */
 
-    int		ch_to_be_closed; /* When TRUE reading or writing failed and
-				  * the channel must be closed when it's safe
-				  * to invoke callbacks. */
+    int		ch_to_be_closed; /* bitset of readable fds to be closed.
+				  * When all readable fds have been closed,
+				  * set to (1 << PART_COUNT). */
     int		ch_to_be_freed; /* When TRUE channel must be freed when it's
 				 * safe to invoke callbacks. */
     int		ch_error;	/* When TRUE an error was reported.  Avoids
@@ -1470,6 +1616,7 @@ struct channel_S {
     partial_T	*ch_partial;
     char_u	*ch_close_cb;	/* call when channel is closed */
     partial_T	*ch_close_partial;
+    int		ch_drop_never;
 
     job_T	*ch_job;	/* Job that uses this channel; this does not
 				 * count as a reference to avoid a circular
@@ -1514,6 +1661,10 @@ struct channel_S {
 #define JO_ERR_MODIFIABLE   0x40000000	/* "err_modifiable" (JO_OUT_ << 1) */
 #define JO_ALL		    0x7fffffff
 
+#define JO2_OUT_MSG	    0x0001	/* "out_msg" */
+#define JO2_ERR_MSG	    0x0002	/* "err_msg" (JO_OUT_ << 1) */
+#define JO2_ALL		    0x0003
+
 #define JO_MODE_ALL	(JO_MODE + JO_IN_MODE + JO_OUT_MODE + JO_ERR_MODE)
 #define JO_CB_ALL \
     (JO_CALLBACK + JO_OUT_CALLBACK + JO_ERR_CALLBACK + JO_CLOSE_CALLBACK)
@@ -1525,6 +1676,7 @@ struct channel_S {
 typedef struct
 {
     int		jo_set;		/* JO_ bits for values that were set */
+    int		jo_set2;	/* JO2_ bits for values that were set */
 
     ch_mode_T	jo_mode;
     ch_mode_T	jo_in_mode;
@@ -1536,6 +1688,7 @@ typedef struct
     char_u	*jo_io_name[4];	/* not allocated! */
     int		jo_io_buf[4];
     int		jo_modifiable[4];
+    int		jo_message[4];
     channel_T	*jo_channel;
 
     linenr_T	jo_in_top;
@@ -1551,6 +1704,7 @@ typedef struct
     partial_T	*jo_close_partial; /* not referenced! */
     char_u	*jo_exit_cb;	/* not allocated! */
     partial_T	*jo_exit_partial; /* not referenced! */
+    int		jo_drop_never;
     int		jo_waittime;
     int		jo_timeout;
     int		jo_out_timeout;
@@ -1725,8 +1879,8 @@ struct file_buffer
 
     int		b_flags;	/* various BF_ flags */
 #ifdef FEAT_AUTOCMD
-    int		b_closing;	/* buffer is being closed, don't let
-				   autocommands close it too. */
+    int		b_locked;	/* Buffer is being closed or referenced, don't
+				   let autocommands wipe it out. */
 #endif
 
     /*
@@ -1906,6 +2060,8 @@ struct file_buffer
 #ifdef FEAT_QUICKFIX
     char_u	*b_p_bh;	/* 'bufhidden' */
     char_u	*b_p_bt;	/* 'buftype' */
+#define BUF_HAS_QF_ENTRY 1
+#define BUF_HAS_LL_ENTRY 2
     int		b_has_qf_entry;
 #endif
     int		b_p_bl;		/* 'buflisted' */
@@ -1959,6 +2115,7 @@ struct file_buffer
     long_u	b_p_inde_flags;	/* flags for 'indentexpr' */
     char_u	*b_p_indk;	/* 'indentkeys' */
 #endif
+    char_u	*b_p_fp;	/* 'formatprg' */
 #if defined(FEAT_EVAL)
     char_u	*b_p_fex;	/* 'formatexpr' */
     long_u	b_p_fex_flags;	/* flags for 'formatexpr' */
@@ -2180,7 +2337,7 @@ struct file_buffer
 /*
  * Stuff for diff mode.
  */
-# define DB_COUNT 4	/* up to four buffers can be diff'ed */
+# define DB_COUNT 8	/* up to eight buffers can be diff'ed */
 
 /*
  * Each diffblock defines where a block of lines starts in each of the buffers
@@ -2323,6 +2480,8 @@ typedef struct
     linenr_T	first_lnum;	/* first lnum to search for multi-line pat */
     colnr_T	startcol; /* in win_line() points to char where HL starts */
     colnr_T	endcol;	 /* in win_line() points to char where HL ends */
+    int		is_addpos;	/* position specified directly by
+				   matchaddpos(). TRUE/FALSE */
 #ifdef FEAT_RELTIME
     proftime_T	tm;	/* for a time limit */
 #endif
@@ -3042,13 +3201,15 @@ typedef struct js_reader js_read_T;
 typedef struct timer_S timer_T;
 struct timer_S
 {
-    int		tr_id;
+    long	tr_id;
 #ifdef FEAT_TIMERS
     timer_T	*tr_next;
     timer_T	*tr_prev;
     proftime_T	tr_due;		    /* when the callback is to be invoked */
+    char	tr_firing;	    /* when TRUE callback is being called */
+    char	tr_paused;	    /* when TRUE callback is not invoked */
     int		tr_repeat;	    /* number of times to repeat, -1 forever */
-    long	tr_interval;	    /* only set when it repeats */
+    long	tr_interval;	    /* msec */
     char_u	*tr_callback;	    /* allocated */
     partial_T	*tr_partial;
 #endif
@@ -3068,6 +3229,8 @@ typedef struct
     int		argc;
     char	**argv;
 
+    char_u	*fname;			/* first file to edit */
+
     int		evim_mode;		/* started as "evim" */
     char_u	*use_vimrc;		/* vimrc from -u argument */
 
@@ -3084,8 +3247,8 @@ typedef struct
 #endif
 
     int		want_full_screen;
-    int		stdout_isatty;		/* is stdout a terminal? */
     int		not_a_term;		/* no warning for missing term? */
+    int		tty_fail;		/* exit if not a tty */
     char_u	*term;			/* specified terminal name */
 #ifdef FEAT_CRYPT
     int		ask_for_key;		/* -x argument */

@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -482,7 +482,7 @@ mf_put(
     flags = hp->bh_flags;
 
     if ((flags & BH_LOCKED) == 0)
-	EMSG(_("E293: block was not locked"));
+	IEMSG(_("E293: block was not locked"));
     flags &= ~BH_LOCKED;
     if (dirty)
     {
@@ -796,7 +796,7 @@ mf_release(memfile_T *mfp, int page_count)
     if (mfp->mf_fd < 0 && need_release && p_uc)
     {
 	/* find for which buffer this memfile is */
-	for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+	FOR_ALL_BUFFERS(buf)
 	    if (buf->b_ml.ml_mfp == mfp)
 		break;
 	if (buf != NULL && buf->b_may_swap)
@@ -861,7 +861,7 @@ mf_release_all(void)
     bhdr_T	*hp;
     int		retval = FALSE;
 
-    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+    FOR_ALL_BUFFERS(buf)
     {
 	mfp = buf->b_ml.ml_mfp;
 	if (mfp != NULL)

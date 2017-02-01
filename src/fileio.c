@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -27,10 +27,6 @@
 /* Is there any system that doesn't have access()? */
 #define USE_MCH_ACCESS
 
-#if (defined(sun) || defined(__FreeBSD__)) && defined(S_ISCHR)
-# define OPEN_CHR_FILES
-static int is_dev_fd_file(char_u *fname);
-#endif
 #ifdef FEAT_MBYTE
 static char_u *next_fenc(char_u **pp);
 # ifdef FEAT_EVAL
@@ -212,8 +208,9 @@ filemess(
  *		stdin)
  * READ_DUMMY	read into a dummy buffer (to check if file contents changed)
  * READ_KEEP_UNDO  don't clear undo info or read it from a file
+ * READ_FIFO	read from fifo/socket instead of a file
  *
- * return FAIL for failure, OK otherwise
+ * return FAIL for failure, NOTDONE for directory (failure), or OK
  */
     int
 readfile(
@@ -231,6 +228,7 @@ readfile(
     int		filtering = (flags & READ_FILTER);
     int		read_stdin = (flags & READ_STDIN);
     int		read_buffer = (flags & READ_BUFFER);
+    int		read_fifo = (flags & READ_FIFO);
     int		set_options = newfile || read_buffer
 					   || (eap != NULL && eap->read_edit);
     linenr_T	read_buf_lnum = 1;	/* next line to read from curbuf */
@@ -276,9 +274,9 @@ readfile(
     int		msg_save = msg_scroll;
     linenr_T	read_no_eol_lnum = 0;   /* non-zero lnum when last line of
 					 * last read was missing the eol */
-    int		try_mac = (vim_strchr(p_ffs, 'm') != NULL);
-    int		try_dos = (vim_strchr(p_ffs, 'd') != NULL);
-    int		try_unix = (vim_strchr(p_ffs, 'x') != NULL);
+    int		try_mac;
+    int		try_dos;
+    int		try_unix;
     int		file_rewind = FALSE;
 #ifdef FEAT_MBYTE
     int		can_retry;
@@ -431,7 +429,7 @@ readfile(
 	}
     }
 
-    if (!read_stdin && !read_buffer)
+    if (!read_stdin && !read_buffer && !read_fifo)
     {
 #ifdef UNIX
 	/*
@@ -452,13 +450,18 @@ readfile(
 # endif
 						)
 	{
+	    int retval = FAIL;
+
 	    if (S_ISDIR(perm))
+	    {
 		filemess(curbuf, fname, (char_u *)_("is a directory"), 0);
+		retval = NOTDONE;
+	    }
 	    else
 		filemess(curbuf, fname, (char_u *)_("is not a file"), 0);
 	    msg_end();
 	    msg_scroll = msg_save;
-	    return FAIL;
+	    return retval;
 	}
 #endif
 #if defined(MSWIN)
@@ -489,7 +492,7 @@ readfile(
     if (check_readonly && !readonlymode)
 	curbuf->b_p_ro = FALSE;
 
-    if (newfile && !read_stdin && !read_buffer)
+    if (newfile && !read_stdin && !read_buffer && !read_fifo)
     {
 	/* Remember time of file. */
 	if (mch_stat((char *)fname, &st) >= 0)
@@ -735,6 +738,10 @@ readfile(
     curbuf->b_op_start.lnum = ((from == 0) ? 1 : from);
     curbuf->b_op_start.col = 0;
 
+    try_mac = (vim_strchr(p_ffs, 'm') != NULL);
+    try_dos = (vim_strchr(p_ffs, 'd') != NULL);
+    try_unix = (vim_strchr(p_ffs, 'x') != NULL);
+
 #ifdef FEAT_AUTOCMD
     if (!read_buffer)
     {
@@ -766,6 +773,11 @@ readfile(
 	else
 	    apply_autocmds_exarg(EVENT_FILEREADPRE, sfname, sfname,
 							    FALSE, NULL, eap);
+	/* autocommands may have changed it */
+	try_mac = (vim_strchr(p_ffs, 'm') != NULL);
+	try_dos = (vim_strchr(p_ffs, 'd') != NULL);
+	try_unix = (vim_strchr(p_ffs, 'x') != NULL);
+
 	if (msg_scrolled == n)
 	    msg_scroll = m;
 
@@ -1101,6 +1113,7 @@ retry:
 	 * and we can't do it internally or with iconv().
 	 */
 	if (fio_flags == 0 && !read_stdin && !read_buffer && *p_ccv != NUL
+						    && !read_fifo
 #  ifdef USE_ICONV
 						    && iconv_fd == (iconv_t)-1
 #  endif
@@ -1149,7 +1162,7 @@ retry:
     /* Set "can_retry" when it's possible to rewind the file and try with
      * another "fenc" value.  It's FALSE when no other "fenc" to try, reading
      * stdin or fixed at a specific encoding. */
-    can_retry = (*fenc != NUL && !read_stdin && !keep_dest_enc);
+    can_retry = (*fenc != NUL && !read_stdin && !read_fifo && !keep_dest_enc);
 #endif
 
     if (!skip_read)
@@ -1166,6 +1179,7 @@ retry:
 				  && curbuf->b_ffname != NULL
 				  && curbuf->b_p_udf
 				  && !filtering
+				  && !read_fifo
 				  && !read_stdin
 				  && !read_buffer);
 	if (read_undo_file)
@@ -2237,8 +2251,9 @@ rewind_retry:
 			len = (colnr_T)(ptr - line_start + 1);
 			if (fileformat == EOL_DOS)
 			{
-			    if (ptr[-1] == CAR)	/* remove CR */
+			    if (ptr > line_start && ptr[-1] == CAR)
 			    {
+				/* remove CR before NL */
 				ptr[-1] = NUL;
 				--len;
 			    }
@@ -2666,7 +2681,7 @@ failed:
 #endif
 
 #ifdef FEAT_AUTOCMD
-    if (!read_stdin && !read_buffer)
+    if (!read_stdin && !read_fifo && (!read_buffer || sfname != NULL))
     {
 	int m = msg_scroll;
 	int n = msg_scrolled;
@@ -2685,7 +2700,7 @@ failed:
 	if (filtering)
 	    apply_autocmds_exarg(EVENT_FILTERREADPOST, NULL, sfname,
 							  FALSE, curbuf, eap);
-	else if (newfile)
+	else if (newfile || (read_buffer && sfname != NULL))
 	{
 	    apply_autocmds_exarg(EVENT_BUFREADPOST, NULL, sfname,
 							  FALSE, curbuf, eap);
@@ -2714,14 +2729,14 @@ failed:
     return OK;
 }
 
-#ifdef OPEN_CHR_FILES
+#if defined(OPEN_CHR_FILES) || defined(PROTO)
 /*
  * Returns TRUE if the file name argument is of the form "/dev/fd/\d\+",
  * which is the name of files used for process substitution output by
  * some shells on some operating systems, e.g., bash on SunOS.
  * Do not accept "/dev/fd/[012]", opening these may hang Vim.
  */
-    static int
+    int
 is_dev_fd_file(char_u *fname)
 {
     return (STRNCMP(fname, "/dev/fd/", 8) == 0
@@ -3011,6 +3026,9 @@ check_for_cryptkey(
 
 	    /* Remove cryptmethod specific header from the text. */
 	    header_len = crypt_get_header_len(method);
+	    if (*sizep <= header_len)
+		/* invalid header, buffer can't be encrypted */
+		return NULL;
 	    *filesizep += header_len;
 	    *sizep -= header_len;
 	    mch_memmove(ptr, ptr + header_len, (size_t)*sizep);
@@ -6088,7 +6106,7 @@ shorten_fnames(int force)
     char_u	*p;
 
     mch_dirname(dirname, MAXPATHL);
-    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+    FOR_ALL_BUFFERS(buf)
     {
 	if (buf->b_fname != NULL
 #ifdef FEAT_QUICKFIX
@@ -6680,7 +6698,7 @@ check_timestamps(
 	++no_wait_return;
 	did_check_timestamps = TRUE;
 	already_warned = FALSE;
-	for (buf = firstbuf; buf != NULL; )
+	FOR_ALL_BUFFERS(buf)
 	{
 	    /* Only check buffers in a window. */
 	    if (buf->b_nwindows > 0)
@@ -6699,7 +6717,6 @@ check_timestamps(
 		    continue;
 		}
 	    }
-	    buf = buf->b_next;
 	}
 	--no_wait_return;
 	need_check_timestamps = FALSE;
@@ -7134,7 +7151,7 @@ buf_reload(buf_T *buf, int orig_mode)
 #endif
 	    if (readfile(buf->b_ffname, buf->b_fname, (linenr_T)0,
 			(linenr_T)0,
-			(linenr_T)MAXLNUM, &ea, flags) == FAIL)
+			(linenr_T)MAXLNUM, &ea, flags) != OK)
 	    {
 #if defined(FEAT_AUTOCMD) && defined(FEAT_EVAL)
 		if (!aborting())
@@ -7706,6 +7723,8 @@ static struct event_name
     {"StdinReadPre",	EVENT_STDINREADPRE},
     {"SwapExists",	EVENT_SWAPEXISTS},
     {"Syntax",		EVENT_SYNTAX},
+    {"TabNew",		EVENT_TABNEW},
+    {"TabClosed",	EVENT_TABCLOSED},
     {"TabEnter",	EVENT_TABENTER},
     {"TabLeave",	EVENT_TABLEAVE},
     {"TermChanged",	EVENT_TERMCHANGED},
@@ -7716,6 +7735,7 @@ static struct event_name
     {"VimEnter",	EVENT_VIMENTER},
     {"VimLeave",	EVENT_VIMLEAVE},
     {"VimLeavePre",	EVENT_VIMLEAVEPRE},
+    {"WinNew",		EVENT_WINNEW},
     {"WinEnter",	EVENT_WINENTER},
     {"WinLeave",	EVENT_WINLEAVE},
     {"VimResized",	EVENT_VIMRESIZED},
@@ -7756,6 +7776,8 @@ static AutoPatCmd *active_apc_list = NULL; /* stack of active autocommands */
  */
 static garray_T augroups = {0, 0, sizeof(char_u *), 10, NULL};
 #define AUGROUP_NAME(i) (((char_u **)augroups.ga_data)[i])
+/* use get_deleted_augroup() to get this */
+static char_u *deleted_augroup = NULL;
 
 /*
  * The ID of the current group.  Group 0 is the default one.
@@ -7787,6 +7809,14 @@ static event_T	last_event;
 static int	last_group;
 static int	autocmd_blocked = 0;	/* block all autocmds */
 
+    static char_u *
+get_deleted_augroup(void)
+{
+    if (deleted_augroup == NULL)
+	deleted_augroup = (char_u *)_("--Deleted--");
+    return deleted_augroup;
+}
+
 /*
  * Show the autocommands for one AutoPat.
  */
@@ -7810,7 +7840,7 @@ show_autocmd(AutoPat *ap, event_T event)
 	if (ap->group != AUGROUP_DEFAULT)
 	{
 	    if (AUGROUP_NAME(ap->group) == NULL)
-		msg_puts_attr((char_u *)_("--Deleted--"), hl_attr(HLF_E));
+		msg_puts_attr(get_deleted_augroup(), hl_attr(HLF_E));
 	    else
 		msg_puts_attr(AUGROUP_NAME(ap->group), hl_attr(HLF_T));
 	    msg_puts((char_u *)"  ");
@@ -8005,10 +8035,33 @@ au_del_group(char_u *name)
     i = au_find_group(name);
     if (i == AUGROUP_ERROR)	/* the group doesn't exist */
 	EMSG2(_("E367: No such group: \"%s\""), name);
+    else if (i == current_augroup)
+	EMSG(_("E936: Cannot delete the current group"));
     else
     {
+	event_T	event;
+	AutoPat	*ap;
+	int	in_use = FALSE;
+
+	for (event = (event_T)0; (int)event < (int)NUM_EVENTS;
+					    event = (event_T)((int)event + 1))
+	{
+	    for (ap = first_autopat[(int)event]; ap != NULL; ap = ap->next)
+		if (ap->group == i && ap->pat != NULL)
+		{
+		    give_warning((char_u *)_("W19: Deleting augroup that is still in use"), TRUE);
+		    in_use = TRUE;
+		    event = NUM_EVENTS;
+		    break;
+		}
+	}
 	vim_free(AUGROUP_NAME(i));
-	AUGROUP_NAME(i) = NULL;
+	if (in_use)
+	{
+	    AUGROUP_NAME(i) = get_deleted_augroup();
+	}
+	else
+	    AUGROUP_NAME(i) = NULL;
     }
 }
 
@@ -8022,7 +8075,8 @@ au_find_group(char_u *name)
     int	    i;
 
     for (i = 0; i < augroups.ga_len; ++i)
-	if (AUGROUP_NAME(i) != NULL && STRCMP(AUGROUP_NAME(i), name) == 0)
+	if (AUGROUP_NAME(i) != NULL && AUGROUP_NAME(i) != get_deleted_augroup()
+		&& STRCMP(AUGROUP_NAME(i), name) == 0)
 	    return i;
     return AUGROUP_ERROR;
 }
@@ -8079,10 +8133,20 @@ do_augroup(char_u *arg, int del_group)
     void
 free_all_autocmds(void)
 {
+    int		i;
+    char_u	*s;
+
     for (current_augroup = -1; current_augroup < augroups.ga_len;
 							    ++current_augroup)
 	do_autocmd((char_u *)"", TRUE);
-    ga_clear_strings(&augroups);
+
+    for (i = 0; i < augroups.ga_len; ++i)
+    {
+	s = ((char_u **)(augroups.ga_data))[i];
+	if (s != get_deleted_augroup())
+	    vim_free(s);
+    }
+    ga_clear(&augroups);
 }
 #endif
 
@@ -8098,8 +8162,8 @@ event_name2nr(char_u *start, char_u **end)
     int		i;
     int		len;
 
-    /* the event name ends with end of line, a blank or a comma */
-    for (p = start; *p && !vim_iswhite(*p) && *p != ','; ++p)
+    /* the event name ends with end of line, '|', a blank or a comma */
+    for (p = start; *p && !vim_iswhite(*p) && *p != ',' && *p != '|'; ++p)
 	;
     for (i = 0; event_names[i].name != NULL; ++i)
     {
@@ -8151,7 +8215,7 @@ find_end_event(
     }
     else
     {
-	for (pat = arg; *pat && !vim_iswhite(*pat); pat = p)
+	for (pat = arg; *pat && *pat != '|' && !vim_iswhite(*pat); pat = p)
 	{
 	    if ((int)event_name2nr(pat, &p) >= (int)NUM_EVENTS)
 	    {
@@ -8284,8 +8348,9 @@ au_event_restore(char_u *old_ei)
  * Mostly a {group} argument can optionally appear before <event>.
  */
     void
-do_autocmd(char_u *arg, int forceit)
+do_autocmd(char_u *arg_in, int forceit)
 {
+    char_u	*arg = arg_in;
     char_u	*pat;
     char_u	*envpat = NULL;
     char_u	*cmd;
@@ -8294,12 +8359,20 @@ do_autocmd(char_u *arg, int forceit)
     int		nested = FALSE;
     int		group;
 
-    /*
-     * Check for a legal group name.  If not, use AUGROUP_ALL.
-     */
-    group = au_get_grouparg(&arg);
-    if (arg == NULL)	    /* out of memory */
-	return;
+    if (*arg == '|')
+    {
+	arg = (char_u *)"";
+	group = AUGROUP_ALL;	/* no argument, use all groups */
+    }
+    else
+    {
+	/*
+	 * Check for a legal group name.  If not, use AUGROUP_ALL.
+	 */
+	group = au_get_grouparg(&arg);
+	if (arg == NULL)	    /* out of memory */
+	    return;
+    }
 
     /*
      * Scan over the events.
@@ -8309,53 +8382,61 @@ do_autocmd(char_u *arg, int forceit)
     if (pat == NULL)
 	return;
 
-    /*
-     * Scan over the pattern.  Put a NUL at the end.
-     */
     pat = skipwhite(pat);
-    cmd = pat;
-    while (*cmd && (!vim_iswhite(*cmd) || cmd[-1] == '\\'))
-	cmd++;
-    if (*cmd)
-	*cmd++ = NUL;
-
-    /* Expand environment variables in the pattern.  Set 'shellslash', we want
-     * forward slashes here. */
-    if (vim_strchr(pat, '$') != NULL || vim_strchr(pat, '~') != NULL)
+    if (*pat == '|')
     {
-#ifdef BACKSLASH_IN_FILENAME
-	int	p_ssl_save = p_ssl;
-
-	p_ssl = TRUE;
-#endif
-	envpat = expand_env_save(pat);
-#ifdef BACKSLASH_IN_FILENAME
-	p_ssl = p_ssl_save;
-#endif
-	if (envpat != NULL)
-	    pat = envpat;
+	pat = (char_u *)"";
+	cmd = (char_u *)"";
     }
-
-    /*
-     * Check for "nested" flag.
-     */
-    cmd = skipwhite(cmd);
-    if (*cmd != NUL && STRNCMP(cmd, "nested", 6) == 0 && vim_iswhite(cmd[6]))
+    else
     {
-	nested = TRUE;
-	cmd = skipwhite(cmd + 6);
-    }
+	/*
+	 * Scan over the pattern.  Put a NUL at the end.
+	 */
+	cmd = pat;
+	while (*cmd && (!vim_iswhite(*cmd) || cmd[-1] == '\\'))
+	    cmd++;
+	if (*cmd)
+	    *cmd++ = NUL;
 
-    /*
-     * Find the start of the commands.
-     * Expand <sfile> in it.
-     */
-    if (*cmd != NUL)
-    {
-	cmd = expand_sfile(cmd);
-	if (cmd == NULL)	    /* some error */
-	    return;
-	need_free = TRUE;
+	/* Expand environment variables in the pattern.  Set 'shellslash', we want
+	 * forward slashes here. */
+	if (vim_strchr(pat, '$') != NULL || vim_strchr(pat, '~') != NULL)
+	{
+#ifdef BACKSLASH_IN_FILENAME
+	    int	p_ssl_save = p_ssl;
+
+	    p_ssl = TRUE;
+#endif
+	    envpat = expand_env_save(pat);
+#ifdef BACKSLASH_IN_FILENAME
+	    p_ssl = p_ssl_save;
+#endif
+	    if (envpat != NULL)
+		pat = envpat;
+	}
+
+	/*
+	 * Check for "nested" flag.
+	 */
+	cmd = skipwhite(cmd);
+	if (*cmd != NUL && STRNCMP(cmd, "nested", 6) == 0 && vim_iswhite(cmd[6]))
+	{
+	    nested = TRUE;
+	    cmd = skipwhite(cmd + 6);
+	}
+
+	/*
+	 * Find the start of the commands.
+	 * Expand <sfile> in it.
+	 */
+	if (*cmd != NUL)
+	{
+	    cmd = expand_sfile(cmd);
+	    if (cmd == NULL)	    /* some error */
+		return;
+	    need_free = TRUE;
+	}
     }
 
     /*
@@ -8372,7 +8453,7 @@ do_autocmd(char_u *arg, int forceit)
      */
     last_event = (event_T)-1;		/* for listing the event name */
     last_group = AUGROUP_ERROR;		/* for listing the group name */
-    if (*arg == '*' || *arg == NUL)
+    if (*arg == '*' || *arg == NUL || *arg == '|')
     {
 	for (event = (event_T)0; (int)event < (int)NUM_EVENTS;
 					    event = (event_T)((int)event + 1))
@@ -8382,7 +8463,7 @@ do_autocmd(char_u *arg, int forceit)
     }
     else
     {
-	while (*arg && !vim_iswhite(*arg))
+	while (*arg && *arg != '|' && !vim_iswhite(*arg))
 	    if (do_autocmd_event(event_name2nr(arg, &arg), pat,
 					nested,	cmd, forceit, group) == FAIL)
 		break;
@@ -8407,7 +8488,8 @@ au_get_grouparg(char_u **argp)
     char_u	*arg = *argp;
     int		group = AUGROUP_ALL;
 
-    p = skiptowhite(arg);
+    for (p = arg; *p && !vim_iswhite(*p) && *p != '|'; ++p)
+	;
     if (p > arg)
     {
 	group_name = vim_strnsave(arg, (int)(p - arg));
@@ -8756,7 +8838,7 @@ ex_doautoall(exarg_T *eap)
      * gives problems when the autocommands make changes to the list of
      * buffers or windows...
      */
-    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+    FOR_ALL_BUFFERS(buf)
     {
 	if (buf->b_ml.ml_mfp != NULL)
 	{
@@ -8828,7 +8910,7 @@ aucmd_prepbuf(
 	win = curwin;
     else
 #ifdef FEAT_WINDOWS
-	for (win = firstwin; win != NULL; win = win->w_next)
+	FOR_ALL_WINDOWS(win)
 	    if (win->w_buffer == buf)
 		break;
 #else
@@ -9810,7 +9892,8 @@ get_augroup_name(expand_T *xp UNUSED, int idx)
 	return (char_u *)"END";
     if (idx >= augroups.ga_len)		/* end of list */
 	return NULL;
-    if (AUGROUP_NAME(idx) == NULL)	/* skip deleted entries */
+    if (AUGROUP_NAME(idx) == NULL || AUGROUP_NAME(idx) == get_deleted_augroup())
+	/* skip deleted entries */
 	return (char_u *)"";
     return AUGROUP_NAME(idx);		/* return a name */
 }
@@ -9874,7 +9957,8 @@ get_event_name(expand_T *xp UNUSED, int idx)
 {
     if (idx < augroups.ga_len)		/* First list group names, if wanted */
     {
-	if (!include_groups || AUGROUP_NAME(idx) == NULL)
+	if (!include_groups || AUGROUP_NAME(idx) == NULL
+				 || AUGROUP_NAME(idx) == get_deleted_augroup())
 	    return (char_u *)"";	/* skip deleted entries */
 	return AUGROUP_NAME(idx);	/* return a name */
     }

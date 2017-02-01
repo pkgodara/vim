@@ -1,6 +1,6 @@
 " Test for reading and writing .viminfo
 
-function Test_read_and_write()
+function Test_viminfo_read_and_write()
   call histdel(':')
   let lines = [
 	\ '# comment line',
@@ -17,7 +17,7 @@ function Test_read_and_write()
   let lines = readfile('Xviminfo')
   let done = 0
   for line in lines
-    if line[0] == '|' && line !~ '^|[234],'
+    if line[0] == '|' && line !~ '^|[234],' && line !~ '^|<'
       if done == 0
 	call assert_equal('|1,4', line)
       elseif done == 1
@@ -213,6 +213,19 @@ func Test_viminfo_registers()
   call assert_equal("V", getregtype('c'))
   call assert_equal(l, getreg('d', 1, 1))
   call assert_equal("V", getregtype('d'))
+
+  " Length around 440 switches to line continuation.
+  let len = 434
+  while len < 445
+    let s = repeat('a', len)
+    call setreg('"', s)
+    wviminfo Xviminfo
+    call setreg('"', '')
+    rviminfo Xviminfo
+    call assert_equal(s, getreg('"'), 'wrong register at length: ' . len)
+
+    let len += 1
+  endwhile
 
   call delete('Xviminfo')
 endfunc
@@ -424,4 +437,79 @@ func Test_viminfo_file_marks()
   close
 
   call delete('Xviminfo')
+endfunc
+
+func Test_viminfo_file_mark_tabclose()
+  tabnew Xtestfileintab
+  call setline(1, ['a','b','c','d','e'])
+  4
+  q!
+  wviminfo Xviminfo
+  sp Xviminfo
+  /^> .*Xtestfileintab
+  let lnum = line('.')
+  while 1
+    if lnum == line('$')
+      call assert_false(1, 'mark not found in Xtestfileintab')
+      break
+    endif
+    let lnum += 1
+    let line = getline(lnum)
+    if line == ''
+      call assert_false(1, 'mark not found in Xtestfileintab')
+      break
+    endif
+    if line =~ "^\t\""
+      call assert_equal('4', substitute(line, ".*\"\t\\(\\d\\).*", '\1', ''))
+      break
+    endif
+  endwhile
+
+  call delete('Xviminfo')
+  silent! bwipe Xtestfileintab
+endfunc
+
+func Test_viminfo_file_mark_zero_time()
+  let lines = [
+	\ '# Viminfo version',
+	\ '|1,4',
+	\ '',
+	\ '*encoding=utf-8',
+	\ '',
+	\ '# File marks:',
+	\ "'B  1  0  /tmp/nothing",
+	\ '|4,66,1,0,0,"/tmp/nothing"',
+	\ "",
+	\ ]
+  call writefile(lines, 'Xviminfo')
+  delmark B
+  rviminfo Xviminfo
+  call delete('Xviminfo')
+  call assert_equal(1, line("'B"))
+  delmark B
+endfunc
+
+func Test_viminfo_oldfiles()
+  let v:oldfiles = []
+  let lines = [
+	\ '# comment line',
+	\ '*encoding=utf-8',
+	\ '',
+	\ "> /tmp/file_one.txt",
+	\ "\t\"\t11\t0",
+	\ "",
+	\ "> /tmp/file_two.txt",
+	\ "\t\"\t11\t0",
+	\ "",
+	\ "> /tmp/another.txt",
+	\ "\t\"\t11\t0",
+	\ "",
+	\ ]
+  call writefile(lines, 'Xviminfo')
+  rviminfo! Xviminfo
+  call delete('Xviminfo')
+
+  call assert_equal(['1: /tmp/file_one.txt', '2: /tmp/file_two.txt', '3: /tmp/another.txt'], filter(split(execute('oldfiles'), "\n"), {i, v -> v =~ '/tmp/'}))
+  call assert_equal(['1: /tmp/file_one.txt', '2: /tmp/file_two.txt'], filter(split(execute('filter file_ oldfiles'), "\n"), {i, v -> v =~ '/tmp/'}))
+  call assert_equal(['3: /tmp/another.txt'], filter(split(execute('filter /another/ oldfiles'), "\n"), {i, v -> v =~ '/tmp/'}))
 endfunc

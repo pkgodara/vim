@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -179,8 +179,8 @@ static void ins_compl_add_dict(dict_T *dict);
 #endif
 static int  ins_compl_get_exp(pos_T *ini);
 static void ins_compl_delete(void);
-static void ins_compl_insert(void);
-static int  ins_compl_next(int allow_get_expansion, int count, int insert_match);
+static void ins_compl_insert(int in_compl_func);
+static int  ins_compl_next(int allow_get_expansion, int count, int insert_match, int in_compl_func);
 static int  ins_compl_key2dir(int c);
 static int  ins_compl_pum_key(int c);
 static int  ins_compl_key2count(int c);
@@ -309,6 +309,7 @@ static int	dont_sync_undo = FALSE;	/* CTRL-G U prevents syncing undo for
  * "cmdchar" can be:
  * 'i'	normal insert command
  * 'a'	normal append command
+ * K_PS bracketed paste
  * 'R'	replace command
  * 'r'	"r<CR>" command: insert one <CR>.  Note: count can be > 1, for redo,
  *	but still only one <CR> is inserted.  The <Esc> is not used for redo.
@@ -462,7 +463,10 @@ edit(
 	else
 #endif
 	{
-	    AppendCharToRedobuff(cmdchar);
+	    if (cmdchar == K_PS)
+		AppendCharToRedobuff('a');
+	    else
+		AppendCharToRedobuff(cmdchar);
 	    if (cmdchar == 'g')		    /* "gI" command */
 		AppendCharToRedobuff('I');
 	    else if (cmdchar == 'r')	    /* "r<CR>" command */
@@ -530,6 +534,10 @@ edit(
     revins_legal = 0;
     revins_scol = -1;
 #endif
+    if (!p_ek)
+	/* Disable bracketed paste mode, we won't recognize the escape
+	 * sequences. */
+	out_str(T_BD);
 
     /*
      * Handle restarting Insert mode.
@@ -782,10 +790,14 @@ edit(
 	    dont_sync_undo = TRUE;
 	else
 	    dont_sync_undo = FALSE;
-	do
-	{
-	    c = safe_vgetc();
-	} while (c == K_IGNORE);
+	if (cmdchar == K_PS)
+	    /* Got here from normal mode when bracketed paste started. */
+	    c = K_PS;
+	else
+	    do
+	    {
+		c = safe_vgetc();
+	    } while (c == K_IGNORE);
 
 #ifdef FEAT_AUTOCMD
 	/* Don't want K_CURSORHOLD for the second key, e.g., after CTRL-V. */
@@ -857,11 +869,12 @@ edit(
 
 		/* Pressing CTRL-Y selects the current match.  When
 		 * compl_enter_selects is set the Enter key does the same. */
-		if (c == Ctrl_Y || (compl_enter_selects
-				   && (c == CAR || c == K_KENTER || c == NL)))
+		if ((c == Ctrl_Y || (compl_enter_selects
+				    && (c == CAR || c == K_KENTER || c == NL)))
+			&& stop_arrow() == OK)
 		{
 		    ins_compl_delete();
-		    ins_compl_insert();
+		    ins_compl_insert(FALSE);
 		}
 	    }
 	}
@@ -1024,7 +1037,7 @@ doESCkey:
 	case Ctrl_Z:	/* suspend when 'insertmode' set */
 	    if (!p_im)
 		goto normalchar;	/* insert CTRL-Z as normal char */
-	    stuffReadbuff((char_u *)":st\r");
+	    do_cmdline_cmd((char_u *)"stop");
 	    c = Ctrl_O;
 	    /*FALLTHROUGH*/
 
@@ -1192,6 +1205,16 @@ doESCkey:
 	    ins_mousescroll(MSCR_RIGHT);
 	    break;
 #endif
+	case K_PS:
+	    bracketed_paste(PASTE_INSERT, FALSE, NULL);
+	    if (cmdchar == K_PS)
+		/* invoked from normal mode, bail out */
+		goto doESCkey;
+	    break;
+	case K_PE:
+	    /* Got K_PE without K_PS, ignore. */
+	    break;
+
 #ifdef FEAT_GUI_TABLINE
 	case K_TABLINE:
 	case K_TABMENU:
@@ -2298,7 +2321,7 @@ vim_is_ctrl_x_key(int c)
 	case CTRL_X_EVAL:
 	    return (c == Ctrl_P || c == Ctrl_N);
     }
-    EMSG(_(e_internal));
+    internal_error("vim_is_ctrl_x_key()");
     return FALSE;
 }
 
@@ -2798,9 +2821,7 @@ set_completion(colnr_T startcol, list_T *list)
     if (ctrl_x_mode != 0)
 	ins_compl_prep(' ');
     ins_compl_clear();
-
-    if (stop_arrow() == FAIL)
-	return;
+    ins_compl_free();
 
     compl_direction = FORWARD;
     if (startcol > curwin->w_cursor.col)
@@ -3297,7 +3318,7 @@ ins_compl_files(
 			break;
 		}
 		line_breakcheck();
-		ins_compl_check_keys(50);
+		ins_compl_check_keys(50, FALSE);
 	    }
 	    fclose(fp);
 	}
@@ -3876,7 +3897,8 @@ ins_compl_prep(int c)
 		/* put the cursor on the last char, for 'tw' formatting */
 		if (prev_col > 0)
 		    dec_cursor();
-		if (stop_arrow() == OK)
+		/* only format when something was inserted */
+		if (!arrow_used && !ins_need_undo && c != Ctrl_E)
 		    insertchar(NUL, 0, -1);
 		if (prev_col > 0
 			     && ml_get_curline()[curwin->w_cursor.col] != NUL)
@@ -3891,7 +3913,8 @@ ins_compl_prep(int c)
 		    && pum_visible())
 		retval = TRUE;
 
-	    /* CTRL-E means completion is Ended, go back to the typed text. */
+	    /* CTRL-E means completion is Ended, go back to the typed text.
+	     * but only do this, if the Popup is still visible */
 	    if (c == Ctrl_E)
 	    {
 		ins_compl_delete();
@@ -4035,8 +4058,6 @@ ins_compl_next_buf(buf_T *buf, int flag)
 }
 
 #ifdef FEAT_COMPL_FUNC
-static void expand_by_function(int type, char_u *base);
-
 /*
  * Execute user defined complete function 'completefunc' or 'omnifunc', and
  * get matches in "matches".
@@ -4239,7 +4260,7 @@ ins_compl_get_exp(pos_T *ini)
 
     if (!compl_started)
     {
-	for (ins_buf = firstbuf; ins_buf != NULL; ins_buf = ins_buf->b_next)
+	FOR_ALL_BUFFERS(ins_buf)
 	    ins_buf->b_scanned = 0;
 	found_all = FALSE;
 	ins_buf = curbuf;
@@ -4595,7 +4616,7 @@ ins_compl_get_exp(pos_T *ini)
 		break;
 	    /* Fill the popup menu as soon as possible. */
 	    if (type != -1)
-		ins_compl_check_keys(0);
+		ins_compl_check_keys(0, FALSE);
 
 	    if ((ctrl_x_mode != 0 && !CTRL_X_MODE_LINE_OR_EVAL(ctrl_x_mode))
 							 || compl_interrupted)
@@ -4636,14 +4657,19 @@ ins_compl_get_exp(pos_T *ini)
     static void
 ins_compl_delete(void)
 {
-    int	    i;
+    int	    col;
 
     /*
      * In insert mode: Delete the typed part.
      * In replace mode: Put the old characters back, if any.
      */
-    i = compl_col + (compl_cont_status & CONT_ADDING ? compl_length : 0);
-    backspace_until_column(i);
+    col = compl_col + (compl_cont_status & CONT_ADDING ? compl_length : 0);
+    if ((int)curwin->w_cursor.col > col)
+    {
+	if (stop_arrow() == FAIL)
+	    return;
+	backspace_until_column(col);
+    }
 
     /* TODO: is this sufficient for redrawing?  Redrawing everything causes
      * flicker, thus we can't do that. */
@@ -4652,9 +4678,12 @@ ins_compl_delete(void)
     set_vim_var_dict(VV_COMPLETED_ITEM, dict_alloc());
 }
 
-/* Insert the new text being completed. */
+/*
+ * Insert the new text being completed.
+ * "in_compl_func" is TRUE when called from complete_check().
+ */
     static void
-ins_compl_insert(void)
+ins_compl_insert(int in_compl_func)
 {
     dict_T	*dict;
 
@@ -4681,7 +4710,8 @@ ins_compl_insert(void)
 		    EMPTY_IF_NULL(compl_shown_match->cp_text[CPT_INFO]));
     }
     set_vim_var_dict(VV_COMPLETED_ITEM, dict);
-    compl_curr_match = compl_shown_match;
+    if (!in_compl_func)
+	compl_curr_match = compl_shown_match;
 }
 
 /*
@@ -4705,7 +4735,8 @@ ins_compl_next(
     int	    allow_get_expansion,
     int	    count,		/* repeat completion this many times; should
 				   be at least 1 */
-    int	    insert_match)	/* Insert the newly selected match */
+    int	    insert_match,	/* Insert the newly selected match */
+    int	    in_compl_func)	/* called from complete_check() */
 {
     int	    num_matches = -1;
     int	    i;
@@ -4855,7 +4886,7 @@ ins_compl_next(
     else if (insert_match)
     {
 	if (!compl_get_longest || compl_used_match)
-	    ins_compl_insert();
+	    ins_compl_insert(in_compl_func);
 	else
 	    ins_bytes(compl_leader + ins_compl_len());
     }
@@ -4920,9 +4951,11 @@ ins_compl_next(
  * mode.  Also, when compl_pending is not zero, show a completion as soon as
  * possible. -- webb
  * "frequency" specifies out of how many calls we actually check.
+ * "in_compl_func" is TRUE when called from complete_check(), don't set
+ * compl_curr_match.
  */
     void
-ins_compl_check_keys(int frequency)
+ins_compl_check_keys(int frequency, int in_compl_func)
 {
     static int	count = 0;
 
@@ -4948,7 +4981,7 @@ ins_compl_check_keys(int frequency)
 	    c = safe_vgetc();	/* Eat the character */
 	    compl_shows_dir = ins_compl_key2dir(c);
 	    (void)ins_compl_next(FALSE, ins_compl_key2count(c),
-						    c != K_UP && c != K_DOWN);
+				      c != K_UP && c != K_DOWN, in_compl_func);
 	}
 	else
 	{
@@ -4971,7 +5004,7 @@ ins_compl_check_keys(int frequency)
 	int todo = compl_pending > 0 ? compl_pending : -compl_pending;
 
 	compl_pending = 0;
-	(void)ins_compl_next(FALSE, todo, TRUE);
+	(void)ins_compl_next(FALSE, todo, TRUE, in_compl_func);
     }
 }
 
@@ -5054,8 +5087,11 @@ ins_complete(int c, int enable_pum)
     colnr_T	curs_col;	    /* cursor column */
     int		n;
     int		save_w_wrow;
+    int		insert_match;
 
     compl_direction = ins_compl_key2dir(c);
+    insert_match = ins_compl_use_match(c);
+
     if (!compl_started)
     {
 	/* First time we hit ^N or ^P (in a row, I mean) */
@@ -5303,7 +5339,7 @@ ins_complete(int c, int enable_pum)
 	    if (compl_pattern == NULL)
 		return FAIL;
 	    set_cmd_context(&compl_xp, compl_pattern,
-				     (int)STRLEN(compl_pattern), curs_col);
+				  (int)STRLEN(compl_pattern), curs_col, FALSE);
 	    if (compl_xp.xp_context == EXPAND_UNSUCCESSFUL
 		    || compl_xp.xp_context == EXPAND_NOTHING)
 		/* No completion possible, use an empty pattern to get a
@@ -5418,7 +5454,7 @@ ins_complete(int c, int enable_pum)
 	}
 	else
 	{
-	    EMSG2(_(e_intern2), "ins_complete()");
+	    internal_error("ins_complete()");
 	    return FAIL;
 	}
 
@@ -5481,6 +5517,8 @@ ins_complete(int c, int enable_pum)
 	edit_submode_extra = NULL;
 	out_flush();
     }
+    else if (insert_match && stop_arrow() == FAIL)
+	return FAIL;
 
     compl_shown_match = compl_curr_match;
     compl_shows_dir = compl_direction;
@@ -5489,7 +5527,7 @@ ins_complete(int c, int enable_pum)
      * Find next match (and following matches).
      */
     save_w_wrow = curwin->w_wrow;
-    n = ins_compl_next(TRUE, ins_compl_key2count(c), ins_compl_use_match(c));
+    n = ins_compl_next(TRUE, ins_compl_key2count(c), insert_match, FALSE);
 
     /* may undisplay the popup menu */
     ins_compl_upd_pum();
@@ -6128,6 +6166,9 @@ insertchar(
 		&& (!has_mbyte || MB_BYTE2LEN_CHECK(c) == 1)
 #endif
 		&& i < INPUT_BUFLEN
+# ifdef FEAT_FKMAP
+		&& !(p_fkmap && KeyTyped) /* Farsi mode mapping moves cursor */
+# endif
 		&& (textwidth == 0
 		    || (virtcol += byte2cells(buf[i - 1])) < (colnr_T)textwidth)
 		&& !(!no_abbr && !vim_iswordc(c) && vim_iswordc(buf[i - 1])))
@@ -6136,10 +6177,6 @@ insertchar(
 	    c = vgetc();
 	    if (p_hkmap && KeyTyped)
 		c = hkmap(c);		    /* Hebrew mode mapping */
-# ifdef FEAT_FKMAP
-	    if (p_fkmap && KeyTyped)
-		c = fkmap(c);		    /* Farsi mode mapping */
-# endif
 	    buf[i++] = c;
 #else
 	    buf[i++] = vgetc();
@@ -6760,11 +6797,7 @@ comp_textwidth(
 	textwidth -= curwin->w_p_fdc;
 #endif
 #ifdef FEAT_SIGNS
-	if (curwin->w_buffer->b_signlist != NULL
-# ifdef FEAT_NETBEANS_INTG
-			  || curwin->w_buffer->b_has_sign_column
-# endif
-		    )
+	if (signcolumn_on(curwin))
 	    textwidth -= 1;
 #endif
 	if (curwin->w_p_nu || curwin->w_p_rnu)
@@ -8594,6 +8627,9 @@ ins_esc(
 #ifdef CURSOR_SHAPE
     ui_cursor_shape();		/* may show different cursor shape */
 #endif
+    if (!p_ek)
+	/* Re-enable bracketed paste mode. */
+	out_str(T_BE);
 
     /*
      * When recording or for CTRL-O, need to display the new mode.
@@ -9412,6 +9448,105 @@ ins_mousescroll(int dir)
     }
 }
 #endif
+
+/*
+ * Handle receiving P_PS: start paste mode.  Inserts the following text up to
+ * P_PE literally.
+ * When "drop" is TRUE then consume the text and drop it.
+ */
+    int
+bracketed_paste(paste_mode_T mode, int drop, garray_T *gap)
+{
+    int		c;
+    char_u	buf[NUMBUFLEN + MB_MAXBYTES];
+    int		idx = 0;
+    char_u	*end = find_termcode((char_u *)"PE");
+    int		ret_char = -1;
+    int		save_allow_keys = allow_keys;
+    int		save_paste = p_paste;
+    int		save_ai = curbuf->b_p_ai;
+
+    /* If the end code is too long we can't detect it, read everything. */
+    if (STRLEN(end) >= NUMBUFLEN)
+	end = NULL;
+    ++no_mapping;
+    allow_keys = 0;
+    p_paste = TRUE;
+    curbuf->b_p_ai = FALSE;
+
+    for (;;)
+    {
+	/* When the end is not defined read everything. */
+	if (end == NULL && vpeekc() == NUL)
+	    break;
+	c = plain_vgetc();
+#ifdef FEAT_MBYTE
+	if (has_mbyte)
+	    idx += (*mb_char2bytes)(c, buf + idx);
+	else
+#endif
+	    buf[idx++] = c;
+	buf[idx] = NUL;
+	if (end != NUL && STRNCMP(buf, end, idx) == 0)
+	{
+	    if (end[idx] == NUL)
+		break; /* Found the end of paste code. */
+	    continue;
+	}
+	if (!drop)
+	{
+	    switch (mode)
+	    {
+		case PASTE_CMDLINE:
+		    put_on_cmdline(buf, idx, TRUE);
+		    break;
+
+		case PASTE_EX:
+		    if (gap != NULL && ga_grow(gap, idx) == OK)
+		    {
+			mch_memmove((char *)gap->ga_data + gap->ga_len,
+							     buf, (size_t)idx);
+			gap->ga_len += idx;
+		    }
+		    break;
+
+		case PASTE_INSERT:
+		    if (stop_arrow() == OK)
+		    {
+			c = buf[0];
+			if (idx == 1 && (c == CAR || c == K_KENTER || c == NL))
+			    ins_eol(c);
+			else
+			{
+			    ins_char_bytes(buf, idx);
+			    AppendToRedobuffLit(buf, idx);
+			}
+		    }
+		    break;
+
+		case PASTE_ONE_CHAR:
+		    if (ret_char == -1)
+		    {
+#ifdef FEAT_MBYTE
+			if (has_mbyte)
+			    ret_char = (*mb_ptr2char)(buf);
+			else
+#endif
+			    ret_char = buf[0];
+		    }
+		    break;
+	    }
+	}
+	idx = 0;
+    }
+
+    --no_mapping;
+    allow_keys = save_allow_keys;
+    p_paste = save_paste;
+    curbuf->b_p_ai = save_ai;
+
+    return ret_char;
+}
 
 #if defined(FEAT_GUI_TABLINE) || defined(PROTO)
     static void

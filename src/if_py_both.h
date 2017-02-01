@@ -2863,7 +2863,6 @@ FunctionNew(PyTypeObject *subtype, char_u *name, int argc, typval_T *argv,
 	    return NULL;
 	}
 	self->name = vim_strsave(name);
-	func_ref(self->name);
     }
     else
 	if ((self->name = get_expanded_name(name,
@@ -2875,6 +2874,7 @@ FunctionNew(PyTypeObject *subtype, char_u *name, int argc, typval_T *argv,
 	    return NULL;
 	}
 
+    func_ref(self->name);
     self->argc = argc;
     self->argv = argv;
     self->self = selfdict;
@@ -3009,9 +3009,9 @@ FunctionAttr(FunctionObject *self, char *name)
 	return PyString_FromString((char *)(self->name));
     else if (strcmp(name, "args") == 0)
     {
-	if (self->argv == NULL)
+	if (self->argv == NULL || (list = list_alloc()) == NULL)
 	    return AlwaysNone(NULL);
-	list = list_alloc();
+
 	for (i = 0; i < self->argc; ++i)
 	    list_append_tv(list, &self->argv[i]);
 	return NEW_LIST(list);
@@ -5619,6 +5619,7 @@ run_do(const char *cmd, void *arg UNUSED
     int		status;
     PyObject	*pyfunc, *pymain;
     PyObject	*run_ret;
+    buf_T	*was_curbuf = curbuf;
 
     if (u_save((linenr_T)RangeStart - 1, (linenr_T)RangeEnd + 1) != OK)
     {
@@ -5671,7 +5672,9 @@ run_do(const char *cmd, void *arg UNUSED
 #ifdef PY_CAN_RECURSE
 	*pygilstate = PyGILState_Ensure();
 #endif
-	if (!(line = GetBufferLine(curbuf, lnum)))
+	/* Check the line number, the command my have deleted lines. */
+	if (lnum > curbuf->b_ml.ml_line_count
+		|| !(line = GetBufferLine(curbuf, lnum)))
 	    goto err;
 	if (!(linenr = PyInt_FromLong((long) lnum)))
 	{
@@ -5684,9 +5687,19 @@ run_do(const char *cmd, void *arg UNUSED
 	if (!ret)
 	    goto err;
 
+	/* Check that the command didn't switch to another buffer. */
+	if (curbuf != was_curbuf)
+	{
+	    Py_XDECREF(ret);
+	    goto err;
+	}
+
 	if (ret != Py_None)
 	    if (SetBufferLine(curbuf, lnum, ret, NULL) == FAIL)
+	    {
+		Py_XDECREF(ret);
 		goto err;
+	    }
 
 	Py_XDECREF(ret);
 	PythonIO_Flush();
@@ -6310,7 +6323,7 @@ ConvertToPyObject(typval_T *tv)
 	    if (tv->vval.v_partial->pt_dict != NULL)
 		tv->vval.v_partial->pt_dict->dv_refcount++;
 	    return NEW_FUNCTION(tv->vval.v_partial == NULL
-				? (char_u *)"" : tv->vval.v_partial->pt_name,
+			     ? (char_u *)"" : partial_name(tv->vval.v_partial),
 				tv->vval.v_partial->pt_argc, argv,
 				tv->vval.v_partial->pt_dict,
 				tv->vval.v_partial->pt_auto);

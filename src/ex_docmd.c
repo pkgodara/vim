@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -137,7 +137,7 @@ static int	getargopt(exarg_T *eap);
 #endif
 
 static int	check_more(int, int);
-static linenr_T get_address(exarg_T *, char_u **, int addr_type, int skip, int to_other_file);
+static linenr_T get_address(exarg_T *, char_u **, int addr_type, int skip, int to_other_file, int address_count);
 static void	get_flags(exarg_T *eap);
 #if !defined(FEAT_PERL) \
 	|| !defined(FEAT_PYTHON) || !defined(FEAT_PYTHON3) \
@@ -243,9 +243,9 @@ static void	ex_popup(exarg_T *eap);
 # define ex_helpfind		ex_ni
 #endif
 #ifndef FEAT_CSCOPE
-# define do_cscope		ex_ni
-# define do_scscope		ex_ni
-# define do_cstag		ex_ni
+# define ex_cscope		ex_ni
+# define ex_scscope		ex_ni
+# define ex_cstag		ex_ni
 #endif
 #ifndef FEAT_SYN_HL
 # define ex_syntax		ex_ni
@@ -287,6 +287,11 @@ static void	ex_popup(exarg_T *eap);
 # define ex_py3			ex_script_ni
 # define ex_py3do		ex_ni
 # define ex_py3file		ex_ni
+#endif
+#if !defined(FEAT_PYTHON) && !defined(FEAT_PYTHON3)
+# define ex_pyx			ex_script_ni
+# define ex_pyxdo		ex_ni
+# define ex_pyxfile		ex_ni
 #endif
 #ifndef FEAT_TCL
 # define ex_tcl			ex_script_ni
@@ -787,8 +792,13 @@ do_cmdline(
 #endif
 
     /* It's possible to create an endless loop with ":execute", catch that
-     * here.  The value of 200 allows nested function calls, ":source", etc. */
-    if (call_depth == 200)
+     * here.  The value of 200 allows nested function calls, ":source", etc.
+     * Allow 200 or 'maxfuncdepth', whatever is larger. */
+    if (call_depth >= 200
+#ifdef FEAT_EVAL
+	    && call_depth >= p_mfd
+#endif
+	    )
     {
 	EMSG(_("E169: Command too recursive"));
 #ifdef FEAT_EVAL
@@ -1388,8 +1398,6 @@ do_cmdline(
 		    break;
 		case ET_INTERRUPT:
 		    break;
-		default:
-		    p = vim_strsave((char_u *)_(e_internal));
 	    }
 
 	    saved_sourcing_name = sourcing_name;
@@ -1708,7 +1716,7 @@ current_win_nr(win_T *win)
     win_T	*wp;
     int		nr = 0;
 
-    for (wp = firstwin; wp != NULL; wp = wp->w_next)
+    FOR_ALL_WINDOWS(wp)
     {
 	++nr;
 	if (wp == win)
@@ -1723,7 +1731,7 @@ current_tab_nr(tabpage_T *tab)
     tabpage_T	*tp;
     int		nr = 0;
 
-    for (tp = first_tabpage; tp != NULL; tp = tp->tp_next)
+    FOR_ALL_TABPAGES(tp)
     {
 	++nr;
 	if (tp == tab)
@@ -1781,6 +1789,7 @@ do_one_cmd(
     linenr_T		lnum;
     long		n;
     char_u		*errormsg = NULL;	/* error message */
+    char_u		*after_modifier = NULL;
     exarg_T		ea;			/* Ex command arguments */
     long		verbose_save = -1;
     int			save_msg_scroll = msg_scroll;
@@ -1792,6 +1801,7 @@ do_one_cmd(
     cmdmod_T		save_cmdmod;
     int			ni;			/* set when Not Implemented */
     char_u		*cmd;
+    int			address_count = 1;
 
     vim_memset(&ea, 0, sizeof(ea));
     ea.line1 = 1;
@@ -1858,9 +1868,7 @@ do_one_cmd(
 /*
  * 2. Handle command modifiers.
  */
-	p = ea.cmd;
-	if (VIM_ISDIGIT(*ea.cmd))
-	    p = skipwhite(skipdigits(ea.cmd));
+	p = skip_range(ea.cmd, NULL);
 	switch (*p)
 	{
 	    /* When adding an entry, also modify cmd_exists(). */
@@ -1919,6 +1927,31 @@ do_one_cmd(
 			cmdmod.keepjumps = TRUE;
 			continue;
 
+	    case 'f':	/* only accept ":filter {pat} cmd" */
+			{
+			    char_u *reg_pat;
+
+			    if (!checkforcmd(&p, "filter", 4)
+						|| *p == NUL || ends_excmd(*p))
+				break;
+			    if (*p == '!')
+			    {
+				cmdmod.filter_force = TRUE;
+				p = skipwhite(p + 1);
+				if (*p == NUL || ends_excmd(*p))
+				    break;
+			    }
+			    p = skip_vimgrep_pat(p, &reg_pat, NULL);
+			    if (p == NULL || *p == NUL)
+				break;
+			    cmdmod.filter_regmatch.regprog =
+						vim_regcomp(reg_pat, RE_MAGIC);
+			    if (cmdmod.filter_regmatch.regprog == NULL)
+				break;
+			    ea.cmd = p;
+			    continue;
+			}
+
 			/* ":hide" and ":hide | cmd" are not modifiers */
 	    case 'h':	if (p != ea.cmd || !checkforcmd(&p, "hide", 3)
 					       || *p == NUL || ends_excmd(*p))
@@ -1954,7 +1987,7 @@ do_one_cmd(
 #endif
 			    continue;
 			}
-			if (!checkforcmd(&ea.cmd, "noswapfile", 6))
+			if (!checkforcmd(&ea.cmd, "noswapfile", 3))
 			    break;
 			cmdmod.noswapfile = TRUE;
 			continue;
@@ -1992,10 +2025,19 @@ do_one_cmd(
 	    case 't':	if (checkforcmd(&p, "tab", 3))
 			{
 #ifdef FEAT_WINDOWS
-			    if (vim_isdigit(*ea.cmd))
-				cmdmod.tab = atoi((char *)ea.cmd) + 1;
-			    else
+			    long tabnr = get_address(&ea, &ea.cmd, ADDR_TABS,
+							    ea.skip, FALSE, 1);
+			    if (tabnr == MAXLNUM)
 				cmdmod.tab = tabpage_index(curtab) + 1;
+			    else
+			    {
+				if (tabnr < 0 || tabnr > LAST_TAB_NR)
+				{
+				    errormsg = (char_u *)_(e_invrange);
+				    goto doend;
+				}
+				cmdmod.tab = tabnr + 1;
+			    }
 			    ea.cmd = p;
 #endif
 			    continue;
@@ -2034,6 +2076,7 @@ do_one_cmd(
 	}
 	break;
     }
+    after_modifier = ea.cmd;
 
 #ifdef FEAT_EVAL
     ea.skip = did_emsg || got_int || did_throw || (cstack->cs_idx >= 0
@@ -2119,8 +2162,7 @@ do_one_cmd(
 		ea.line2 = curwin->w_cursor.lnum;
 		break;
 	    case ADDR_WINDOWS:
-		lnum = CURRENT_WIN_NR;
-		ea.line2 = lnum;
+		ea.line2 = CURRENT_WIN_NR;
 		break;
 	    case ADDR_ARGUMENTS:
 		ea.line2 = curwin->w_arg_idx + 1;
@@ -2132,8 +2174,10 @@ do_one_cmd(
 		ea.line2 = curbuf->b_fnum;
 		break;
 	    case ADDR_TABS:
-		lnum = CURRENT_TAB_NR;
-		ea.line2 = lnum;
+		ea.line2 = CURRENT_TAB_NR;
+		break;
+	    case ADDR_TABS_RELATIVE:
+		ea.line2 = 1;
 		break;
 #ifdef FEAT_QUICKFIX
 	    case ADDR_QUICKFIX:
@@ -2143,7 +2187,7 @@ do_one_cmd(
 	}
 	ea.cmd = skipwhite(ea.cmd);
 	lnum = get_address(&ea, &ea.cmd, ea.addr_type, ea.skip,
-							  ea.addr_count == 0);
+					  ea.addr_count == 0, address_count++);
 	if (ea.cmd == NULL)		    /* error detected */
 	    goto doend;
 	if (lnum == MAXLNUM)
@@ -2191,6 +2235,10 @@ do_one_cmd(
 			    errormsg = (char_u *)_(e_invrange);
 			    goto doend;
 			}
+			break;
+		    case ADDR_TABS_RELATIVE:
+			errormsg = (char_u *)_(e_invrange);
+			goto doend;
 			break;
 		    case ADDR_ARGUMENTS:
 			if (ARGCOUNT == 0)
@@ -2245,7 +2293,11 @@ do_one_cmd(
 	if (*ea.cmd == ';')
 	{
 	    if (!ea.skip)
+	    {
 		curwin->w_cursor.lnum = ea.line2;
+		/* don't leave the cursor on an illegal line */
+		check_cursor_lnum();
+	    }
 	}
 	else if (*ea.cmd != ',')
 	    break;
@@ -2260,9 +2312,6 @@ do_one_cmd(
 	if (lnum == MAXLNUM)
 	    ea.addr_count = 0;
     }
-
-    /* Don't leave the cursor on an illegal line (caused by ';') */
-    check_cursor_lnum();
 
 /*
  * 5. Parse the command.
@@ -2343,7 +2392,7 @@ do_one_cmd(
 	vim_free(p);
 	/* If the autocommands did something and didn't cause an error, try
 	 * finding the command again. */
-	p = (ret && !aborting()) ? find_command(&ea, NULL) : NULL;
+	p = (ret && !aborting()) ? find_command(&ea, NULL) : ea.cmd;
     }
 #endif
 
@@ -2367,7 +2416,14 @@ do_one_cmd(
 	{
 	    STRCPY(IObuff, _("E492: Not an editor command"));
 	    if (!sourcing)
-		append_command(*cmdlinep);
+	    {
+		/* If the modifier was parsed OK the error must be in the
+		 * following command */
+		if (after_modifier != NULL)
+		    append_command(after_modifier);
+		else
+		    append_command(*cmdlinep);
+	    }
 	    errormsg = IObuff;
 	    did_emsg_syntax = TRUE;
 	}
@@ -2434,12 +2490,7 @@ do_one_cmd(
 		&& !IS_USER_CMDIDX(ea.cmdidx))
 	{
 	    /* Command not allowed when editing the command line. */
-#ifdef FEAT_CMDWIN
-	    if (cmdwin_type != 0)
-		errormsg = (char_u *)_(e_cmdwin);
-	    else
-#endif
-		errormsg = (char_u *)_(e_secure);
+	    errormsg = get_text_locked_msg();
 	    goto doend;
 	}
 #ifdef FEAT_AUTOCMD
@@ -2664,6 +2715,9 @@ do_one_cmd(
 	    case ADDR_TABS:
 		ea.line2 = LAST_TAB_NR;
 		break;
+	    case ADDR_TABS_RELATIVE:
+		ea.line2 = 1;
+		break;
 	    case ADDR_ARGUMENTS:
 		if (ARGCOUNT == 0)
 		    ea.line1 = ea.line2 = 0;
@@ -2740,7 +2794,8 @@ do_one_cmd(
 	    /*
 	     * Be vi compatible: no error message for out of range.
 	     */
-	    if (ea.line2 > curbuf->b_ml.ml_line_count)
+	    if (ea.addr_type == ADDR_LINES
+		    && ea.line2 > curbuf->b_ml.ml_line_count)
 		ea.line2 = curbuf->b_ml.ml_line_count;
 	}
     }
@@ -2811,6 +2866,7 @@ do_one_cmd(
 	    case CMD_echomsg:
 	    case CMD_echon:
 	    case CMD_execute:
+	    case CMD_filter:
 	    case CMD_help:
 	    case CMD_hide:
 	    case CMD_ijump:
@@ -2982,6 +3038,8 @@ doend:
 	free_string_option(cmdmod.save_ei);
     }
 #endif
+    if (cmdmod.filter_regmatch.regprog != NULL)
+	vim_regfree(cmdmod.filter_regmatch.regprog);
 
     cmdmod = save_cmdmod;
 
@@ -3316,6 +3374,7 @@ static struct cmdmod
     {"botright", 2, FALSE},
     {"browse", 3, FALSE},
     {"confirm", 4, FALSE},
+    {"filter", 4, FALSE},
     {"hide", 3, FALSE},
     {"keepalt", 5, FALSE},
     {"keepjumps", 5, FALSE},
@@ -3850,6 +3909,16 @@ set_one_cmd_context(
 	case CMD_windo:
 	    return arg;
 
+	case CMD_filter:
+	    if (*arg != NUL)
+		arg = skip_vimgrep_pat(arg, NULL, NULL);
+	    if (arg == NULL || *arg == NUL)
+	    {
+		xp->xp_context = EXPAND_NOTHING;
+		return NULL;
+	    }
+	    return skipwhite(arg);
+
 #ifdef FEAT_CMDL_COMPL
 # ifdef FEAT_SEARCH_EXTRA
 	case CMD_match:
@@ -4054,6 +4123,12 @@ set_one_cmd_context(
 	case CMD_echoerr:
 	case CMD_call:
 	case CMD_return:
+	case CMD_cexpr:
+	case CMD_caddexpr:
+	case CMD_cgetexpr:
+	case CMD_lexpr:
+	case CMD_laddexpr:
+	case CMD_lgetexpr:
 	    set_context_for_expression(xp, arg, ea.cmdidx);
 	    break;
 
@@ -4240,6 +4315,11 @@ set_one_cmd_context(
 	    xp->xp_pattern = arg;
 	    break;
 
+	case CMD_messages:
+	    xp->xp_context = EXPAND_MESSAGES;
+	    xp->xp_pattern = arg;
+	    break;
+
 #if defined(FEAT_CMDHIST)
 	case CMD_history:
 	    xp->xp_context = EXPAND_HISTORY;
@@ -4318,7 +4398,8 @@ get_address(
     char_u	**ptr,
     int		addr_type,  /* flag: one of ADDR_LINES, ... */
     int		skip,	    /* only skip the address, don't use it */
-    int		to_other_file)  /* flag: may jump to other file */
+    int		to_other_file,  /* flag: may jump to other file */
+    int		address_count UNUSED) /* 1 for first address, >1 after comma */
 {
     int		c;
     int		i;
@@ -4354,6 +4435,11 @@ get_address(
 			break;
 		    case ADDR_TABS:
 			lnum = CURRENT_TAB_NR;
+			break;
+		    case ADDR_TABS_RELATIVE:
+			EMSG(_(e_invrange));
+			cmd = NULL;
+			goto error;
 			break;
 #ifdef FEAT_QUICKFIX
 		    case ADDR_QUICKFIX:
@@ -4391,6 +4477,11 @@ get_address(
 			break;
 		    case ADDR_TABS:
 			lnum = LAST_TAB_NR;
+			break;
+		    case ADDR_TABS_RELATIVE:
+			EMSG(_(e_invrange));
+			cmd = NULL;
+			goto error;
 			break;
 #ifdef FEAT_QUICKFIX
 		    case ADDR_QUICKFIX:
@@ -4574,6 +4665,9 @@ get_address(
 		    case ADDR_TABS:
 			lnum = CURRENT_TAB_NR;
 			break;
+		    case ADDR_TABS_RELATIVE:
+			lnum = 1;
+			break;
 #ifdef FEAT_QUICKFIX
 		    case ADDR_QUICKFIX:
 			lnum = qf_get_cur_valid_idx(eap);
@@ -4590,14 +4684,31 @@ get_address(
 		n = 1;
 	    else
 		n = getdigits(&cmd);
-	    if (addr_type == ADDR_LOADED_BUFFERS
+
+	    if (addr_type == ADDR_TABS_RELATIVE)
+	    {
+		EMSG(_(e_invrange));
+		cmd = NULL;
+		goto error;
+	    }
+	    else if (addr_type == ADDR_LOADED_BUFFERS
 		    || addr_type == ADDR_BUFFERS)
 		lnum = compute_buffer_local_count(
 				    addr_type, lnum, (i == '-') ? -1 * n : n);
-	    else if (i == '-')
-		lnum -= n;
 	    else
-		lnum += n;
+	    {
+#ifdef FEAT_FOLDING
+		/* Relative line addressing, need to adjust for folded lines
+		 * now, but only do it after the first address. */
+		if (addr_type == ADDR_LINES && (i == '-' || i == '+')
+			&& address_count >= 2)
+		    (void)hasFolding(lnum, NULL, &lnum);
+#endif
+		if (i == '-')
+		    lnum -= n;
+		else
+		    lnum += n;
+	    }
 	}
     } while (*cmd == '/' || *cmd == '?');
 
@@ -4712,6 +4823,9 @@ invalid_range(exarg_T *eap)
 	    case ADDR_TABS:
 		if (eap->line2 > LAST_TAB_NR)
 		    return (char_u *)_(e_invrange);
+		break;
+	    case ADDR_TABS_RELATIVE:
+		/* Do nothing */
 		break;
 #ifdef FEAT_QUICKFIX
 	    case ADDR_QUICKFIX:
@@ -5588,15 +5702,16 @@ find_nextcmd(char_u *p)
 #endif
 
 /*
- * Check if *p is a separator between Ex commands.
- * Return NULL if it isn't, (p + 1) if it is.
+ * Check if *p is a separator between Ex commands, skipping over white space.
+ * Return NULL if it isn't, the following character if it is.
  */
     char_u *
 check_nextcmd(char_u *p)
 {
-    p = skipwhite(p);
-    if (*p == '|' || *p == '\n')
-	return (p + 1);
+    char_u *s = skipwhite(p);
+
+    if (*s == '|' || *s == '\n')
+	return (s + 1);
     else
 	return NULL;
 }
@@ -5852,6 +5967,7 @@ static struct
 #endif
     {EXPAND_MAPPINGS, "mapping"},
     {EXPAND_MENUS, "menu"},
+    {EXPAND_MESSAGES, "messages"},
     {EXPAND_OWNSYNTAX, "syntax"},
 #if defined(FEAT_PROFILE)
     {EXPAND_SYNTIME, "syntime"},
@@ -5889,8 +6005,10 @@ uc_list(char_u *name, size_t name_len)
 	    cmd = USER_CMD_GA(gap, i);
 	    a = (long)cmd->uc_argt;
 
-	    /* Skip commands which don't match the requested prefix */
-	    if (STRNCMP(name, cmd->uc_name, name_len) != 0)
+	    /* Skip commands which don't match the requested prefix and
+	     * commands filtered out. */
+	    if (STRNCMP(name, cmd->uc_name, name_len) != 0
+		    || message_filtered(cmd->uc_name))
 		continue;
 
 	    /* Put out the title first time */
@@ -7158,7 +7276,7 @@ ex_quit(exarg_T *eap)
     /* Refuse to quit when locked or when the buffer in the last window is
      * being closed (can only happen in autocommands). */
     if (curbuf_locked() || (wp->w_buffer->b_nwindows == 1
-						  && wp->w_buffer->b_closing))
+						&& wp->w_buffer->b_locked > 0))
 	return;
 #endif
 
@@ -7190,7 +7308,7 @@ ex_quit(exarg_T *eap)
 	 * :h|wincmd w|1q     - don't quit
 	 * :h|wincmd w|q      - quit
 	 */
-	if (only_one_window() && (firstwin == lastwin || eap->addr_count == 0))
+	if (only_one_window() && (ONE_WINDOW || eap->addr_count == 0))
 #endif
 	    getout(0);
 #ifdef FEAT_WINDOWS
@@ -7240,7 +7358,7 @@ ex_quit_all(exarg_T *eap)
     apply_autocmds(EVENT_QUITPRE, NULL, NULL, FALSE, curbuf);
     /* Refuse to quit when locked or when the buffer in the last window is
      * being closed (can only happen in autocommands). */
-    if (curbuf_locked() || (curbuf->b_nwindows == 1 && curbuf->b_closing))
+    if (curbuf_locked() || (curbuf->b_nwindows == 1 && curbuf->b_locked > 0))
 	return;
 #endif
 
@@ -7273,7 +7391,7 @@ ex_close(exarg_T *eap)
 	    if (eap->addr_count == 0)
 		ex_win_close(eap->forceit, curwin, NULL);
 	    else {
-		for (win = firstwin; win != NULL; win = win->w_next)
+		FOR_ALL_WINDOWS(win)
 		{
 		    winnr++;
 		    if (winnr == eap->line2)
@@ -7295,7 +7413,7 @@ ex_pclose(exarg_T *eap)
 {
     win_T	*win;
 
-    for (win = firstwin; win != NULL; win = win->w_next)
+    FOR_ALL_WINDOWS(win)
 	if (win->w_p_pvw)
 	{
 	    ex_win_close(eap->forceit, win, NULL);
@@ -7351,6 +7469,107 @@ ex_win_close(
 }
 
 /*
+ * Handle the argument for a tabpage related ex command.
+ * Returns a tabpage number.
+ * When an error is encountered then eap->errmsg is set.
+ */
+    static int
+get_tabpage_arg(exarg_T *eap)
+{
+    int tab_number;
+    int unaccept_arg0 = (eap->cmdidx == CMD_tabmove) ? 0 : 1;
+
+    if (eap->arg && *eap->arg != NUL)
+    {
+	char_u *p = eap->arg;
+	char_u *p_save;
+	int    relative = 0; /* argument +N/-N means: go to N places to the
+			      * right/left relative to the current position. */
+
+	if (*p == '-')
+	{
+	    relative = -1;
+	    p++;
+	}
+	else if (*p == '+')
+	{
+	    relative = 1;
+	    p++;
+	}
+
+	p_save = p;
+	tab_number = getdigits(&p);
+
+	if (relative == 0)
+	{
+	    if (STRCMP(p, "$") == 0)
+		tab_number = LAST_TAB_NR;
+	    else if (p == p_save || *p_save == '-' || *p != NUL
+		    || tab_number > LAST_TAB_NR)
+	    {
+		/* No numbers as argument. */
+		eap->errmsg = e_invarg;
+		goto theend;
+	    }
+	}
+	else
+	{
+	    if (*p_save == NUL)
+		tab_number = 1;
+	    else if (p == p_save || *p_save == '-' || *p != NUL
+		    || tab_number == 0)
+	    {
+		/* No numbers as argument. */
+		eap->errmsg = e_invarg;
+		goto theend;
+	    }
+	    tab_number = tab_number * relative + tabpage_index(curtab);
+	    if (!unaccept_arg0 && relative == -1)
+		--tab_number;
+	}
+	if (tab_number < unaccept_arg0 || tab_number > LAST_TAB_NR)
+	    eap->errmsg = e_invarg;
+    }
+    else if (eap->addr_count > 0)
+    {
+	if (unaccept_arg0 && eap->line2 == 0)
+	{
+	    eap->errmsg = e_invrange;
+	    tab_number = 0;
+	}
+	else
+	{
+	    tab_number = eap->line2;
+	    if (!unaccept_arg0 && **eap->cmdlinep == '-')
+	    {
+		--tab_number;
+		if (tab_number < unaccept_arg0)
+		    eap->errmsg = e_invarg;
+	    }
+	}
+    }
+    else
+    {
+	switch (eap->cmdidx)
+	{
+	case CMD_tabnext:
+	    tab_number = tabpage_index(curtab) + 1;
+	    if (tab_number > LAST_TAB_NR)
+		tab_number = 1;
+	    break;
+	case CMD_tabmove:
+	    tab_number = LAST_TAB_NR;
+	    break;
+	default:
+	    tab_number = tabpage_index(curtab);
+	}
+    }
+
+theend:
+    return tab_number;
+}
+
+/*
  * ":tabclose": close current tab page, unless it is the last one.
  * ":tabclose N": close tab page N.
  */
@@ -7358,6 +7577,7 @@ ex_win_close(
 ex_tabclose(exarg_T *eap)
 {
     tabpage_T	*tp;
+    int		tab_number;
 
 # ifdef FEAT_CMDWIN
     if (cmdwin_type != 0)
@@ -7368,9 +7588,10 @@ ex_tabclose(exarg_T *eap)
 	    EMSG(_("E784: Cannot close last tab page"));
 	else
 	{
-	    if (eap->addr_count > 0)
+	    tab_number = get_tabpage_arg(eap);
+	    if (eap->errmsg == NULL)
 	    {
-		tp = find_tabpage((int)eap->line2);
+		tp = find_tabpage(tab_number);
 		if (tp == NULL)
 		{
 		    beep_flush();
@@ -7381,13 +7602,13 @@ ex_tabclose(exarg_T *eap)
 		    tabpage_close_other(tp, eap->forceit);
 		    return;
 		}
-	    }
-	    if (!text_locked()
+		else if (!text_locked()
 #ifdef FEAT_AUTOCMD
-		    && !curbuf_locked()
+			&& !curbuf_locked()
 #endif
-	       )
-		tabpage_close(eap->forceit);
+		)
+		    tabpage_close(eap->forceit);
+	    }
 	}
 }
 
@@ -7399,6 +7620,7 @@ ex_tabonly(exarg_T *eap)
 {
     tabpage_T	*tp;
     int		done;
+    int		tab_number;
 
 # ifdef FEAT_CMDWIN
     if (cmdwin_type != 0)
@@ -7409,24 +7631,27 @@ ex_tabonly(exarg_T *eap)
 	    MSG(_("Already only one tab page"));
 	else
 	{
-	    if (eap->addr_count > 0)
-		goto_tabpage(eap->line2);
-	    /* Repeat this up to a 1000 times, because autocommands may mess
-	     * up the lists. */
-	    for (done = 0; done < 1000; ++done)
+	    tab_number = get_tabpage_arg(eap);
+	    if (eap->errmsg == NULL)
 	    {
-		for (tp = first_tabpage; tp != NULL; tp = tp->tp_next)
-		    if (tp->tp_topframe != topframe)
-		    {
-			tabpage_close_other(tp, eap->forceit);
-			/* if we failed to close it quit */
-			if (valid_tabpage(tp))
-			    done = 1000;
-			/* start over, "tp" is now invalid */
+		goto_tabpage(tab_number);
+		/* Repeat this up to a 1000 times, because autocommands may
+		 * mess up the lists. */
+		for (done = 0; done < 1000; ++done)
+		{
+		    FOR_ALL_TABPAGES(tp)
+			if (tp->tp_topframe != topframe)
+			{
+			    tabpage_close_other(tp, eap->forceit);
+			    /* if we failed to close it quit */
+			    if (valid_tabpage(tp))
+				done = 1000;
+			    /* start over, "tp" is now invalid */
+			    break;
+			}
+		    if (first_tabpage->tp_next == NULL)
 			break;
-		    }
-		if (first_tabpage->tp_next == NULL)
-		    break;
+		}
 	    }
 	}
 }
@@ -7439,9 +7664,9 @@ tabpage_close(int forceit)
 {
     /* First close all the windows but the current one.  If that worked then
      * close the last window in this tab, that will close it. */
-    if (lastwin != firstwin)
+    if (!ONE_WINDOW)
 	close_others(TRUE, forceit);
-    if (lastwin == firstwin)
+    if (ONE_WINDOW)
 	ex_win_close(forceit, curwin, NULL);
 # ifdef FEAT_GUI
     need_mouse_correct = TRUE;
@@ -7473,6 +7698,10 @@ tabpage_close_other(tabpage_T *tp, int forceit)
 	if (!valid_tabpage(tp) || tp->tp_firstwin == wp)
 	    break;
     }
+
+#ifdef FEAT_AUTOCMD
+    apply_autocmds(EVENT_TABCLOSED, NULL, NULL, FALSE, curbuf);
+#endif
 
     redraw_tabline = TRUE;
     if (h != tabline_height())
@@ -7519,40 +7748,34 @@ ex_all(exarg_T *eap)
 #endif /* FEAT_WINDOWS */
 
     static void
-ex_hide(exarg_T *eap)
+ex_hide(exarg_T *eap UNUSED)
 {
-    if (*eap->arg != NUL && check_nextcmd(eap->arg) == NULL)
-	eap->errmsg = e_invarg;
-    else
-    {
-	/* ":hide" or ":hide | cmd": hide current window */
-	eap->nextcmd = check_nextcmd(eap->arg);
+    /* ":hide" or ":hide | cmd": hide current window */
 #ifdef FEAT_WINDOWS
-	if (!eap->skip)
-	{
+    if (!eap->skip)
+    {
 # ifdef FEAT_GUI
-	    need_mouse_correct = TRUE;
+	need_mouse_correct = TRUE;
 # endif
-	    if (eap->addr_count == 0)
-		win_close(curwin, FALSE);	/* don't free buffer */
-	    else
-	    {
-		int	winnr = 0;
-		win_T	*win;
+	if (eap->addr_count == 0)
+	    win_close(curwin, FALSE);	/* don't free buffer */
+	else
+	{
+	    int	winnr = 0;
+	    win_T	*win;
 
-		for (win = firstwin; win != NULL; win = win->w_next)
-		{
-		    winnr++;
-		    if (winnr == eap->line2)
-			break;
-		}
-		if (win == NULL)
-		    win = lastwin;
-		win_close(win, FALSE);
+	    FOR_ALL_WINDOWS(win)
+	    {
+		winnr++;
+		if (winnr == eap->line2)
+		    break;
 	    }
+	    if (win == NULL)
+		win = lastwin;
+	    win_close(win, FALSE);
 	}
-#endif
     }
+#endif
 }
 
 /*
@@ -7564,14 +7787,7 @@ ex_stop(exarg_T *eap)
     /*
      * Disallow suspending for "rvim".
      */
-    if (!check_restricted()
-#ifdef WIN3264
-	/*
-	 * Check if external commands are allowed now.
-	 */
-	&& can_end_termcap_mode(TRUE)
-#endif
-					)
+    if (!check_restricted())
     {
 	if (!eap->forceit)
 	    autowrite_all();
@@ -7618,7 +7834,7 @@ ex_exit(exarg_T *eap)
     apply_autocmds(EVENT_QUITPRE, NULL, NULL, FALSE, curbuf);
     /* Refuse to quit when locked or when the buffer in the last window is
      * being closed (can only happen in autocommands). */
-    if (curbuf_locked() || (curbuf->b_nwindows == 1 && curbuf->b_closing))
+    if (curbuf_locked() || (curbuf->b_nwindows == 1 && curbuf->b_locked > 0))
 	return;
 #endif
 
@@ -8177,6 +8393,8 @@ tabpage_new(void)
     static void
 ex_tabnext(exarg_T *eap)
 {
+    int tab_number;
+
     switch (eap->cmdidx)
     {
 	case CMD_tabfirst:
@@ -8188,10 +8406,40 @@ ex_tabnext(exarg_T *eap)
 	    break;
 	case CMD_tabprevious:
 	case CMD_tabNext:
-	    goto_tabpage(eap->addr_count == 0 ? -1 : -(int)eap->line2);
+	    if (eap->arg && *eap->arg != NUL)
+	    {
+		char_u *p = eap->arg;
+		char_u *p_save = p;
+
+		tab_number = getdigits(&p);
+		if (p == p_save || *p_save == '-' || *p != NUL
+			    || tab_number == 0)
+		{
+		    /* No numbers as argument. */
+		    eap->errmsg = e_invarg;
+		    return;
+		}
+	    }
+	    else
+	    {
+		if (eap->addr_count == 0)
+		    tab_number = 1;
+		else
+		{
+		    tab_number = eap->line2;
+		    if (tab_number < 1)
+		    {
+			eap->errmsg = e_invrange;
+			return;
+		    }
+		}
+	    }
+	    goto_tabpage(-tab_number);
 	    break;
 	default: /* CMD_tabnext */
-	    goto_tabpage(eap->addr_count == 0 ? 0 : (int)eap->line2);
+	    tab_number = get_tabpage_arg(eap);
+	    if (eap->errmsg == NULL)
+		goto_tabpage(tab_number);
 	    break;
     }
 }
@@ -8204,59 +8452,9 @@ ex_tabmove(exarg_T *eap)
 {
     int tab_number;
 
-    if (eap->arg && *eap->arg != NUL)
-    {
-	char_u *p = eap->arg;
-	int    relative = 0; /* argument +N/-N means: move N places to the
-			      * right/left relative to the current position. */
-
-	if (*eap->arg == '-')
-	{
-	    relative = -1;
-	    p = eap->arg + 1;
-	}
-	else if (*eap->arg == '+')
-	{
-	    relative = 1;
-	    p = eap->arg + 1;
-	}
-	else
-	    p = eap->arg;
-
-	if (relative == 0)
-	{
-	    if (STRCMP(p, "$") == 0)
-		tab_number = LAST_TAB_NR;
-	    else if (p == skipdigits(p))
-	    {
-		/* No numbers as argument. */
-		eap->errmsg = e_invarg;
-		return;
-	    }
-	    else
-		tab_number = getdigits(&p);
-	}
-	else
-	{
-	    if (*p != NUL)
-		tab_number = getdigits(&p);
-	    else
-		tab_number = 1;
-	    tab_number = tab_number * relative + tabpage_index(curtab);
-	    if (relative == -1)
-		--tab_number;
-	}
-    }
-    else if (eap->addr_count != 0)
-    {
-	tab_number = eap->line2;
-	if (**eap->cmdlinep == '-')
-	    --tab_number;
-    }
-    else
-	tab_number = LAST_TAB_NR;
-
-    tabpage_move(tab_number);
+    tab_number = get_tabpage_arg(eap);
+    if (eap->errmsg == NULL)
+	tabpage_move(tab_number);
 }
 
 /*
@@ -8686,7 +8884,7 @@ ex_syncbind(exarg_T *eap UNUSED)
     if (curwin->w_p_scb)
     {
 	topline = curwin->w_topline;
-	for (wp = firstwin; wp; wp = wp->w_next)
+	FOR_ALL_WINDOWS(wp)
 	{
 	    if (wp->w_p_scb && wp->w_buffer)
 	    {
@@ -8707,7 +8905,7 @@ ex_syncbind(exarg_T *eap UNUSED)
     /*
      * Set all scrollbind windows to the same topline.
      */
-    for (curwin = firstwin; curwin; curwin = curwin->w_next)
+    FOR_ALL_WINDOWS(curwin)
     {
 	if (curwin->w_p_scb)
 	{
@@ -8791,7 +8989,7 @@ ex_read(exarg_T *eap)
 			  eap->line2, (linenr_T)0, (linenr_T)MAXLNUM, eap, 0);
 
 	}
-	if (i == FAIL)
+	if (i != OK)
 	{
 #if defined(FEAT_AUTOCMD) && defined(FEAT_EVAL)
 	    if (!aborting())
@@ -9018,8 +9216,17 @@ do_sleep(long msec)
 		wait_now = due_time;
 	}
 #endif
+#ifdef FEAT_JOB_CHANNEL
+	if (has_any_channel() && wait_now > 100L)
+	    wait_now = 100L;
+#endif
 	ui_delay(wait_now, TRUE);
-	ui_breakcheck();
+#ifdef FEAT_JOB_CHANNEL
+	if (has_any_channel())
+	    ui_breakcheck_force(TRUE);
+	else
+#endif
+	    ui_breakcheck();
 #ifdef MESSAGE_QUEUE
 	/* Process the netbeans and clientserver messages that may have been
 	 * received in the call to ui_breakcheck() when the GUI is in use. This
@@ -9252,7 +9459,7 @@ ex_copymove(exarg_T *eap)
 {
     long	n;
 
-    n = get_address(eap, &eap->arg, eap->addr_type, FALSE, FALSE);
+    n = get_address(eap, &eap->arg, eap->addr_type, FALSE, FALSE, 1);
     if (eap->arg == NULL)	    /* error detected */
     {
 	eap->nextcmd = NULL;
@@ -9341,6 +9548,7 @@ ex_at(exarg_T *eap)
     int		prev_len = typebuf.tb_len;
 
     curwin->w_cursor.lnum = eap->line2;
+    check_cursor_col();
 
 #ifdef USE_ON_FLY_SCROLL
     dont_scroll = TRUE;		/* disallow scrolling here */
@@ -10373,7 +10581,7 @@ ex_tag_cmd(exarg_T *eap, char_u *name)
 #ifdef FEAT_CSCOPE
 		  if (p_cst && *eap->arg != NUL)
 		  {
-		      do_cstag(eap);
+		      ex_cstag(eap);
 		      return;
 		  }
 #endif
@@ -10957,7 +11165,7 @@ makeopens(
 	return FAIL;
 
     /* Now put the other buffers into the buffer list */
-    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+    FOR_ALL_BUFFERS(buf)
     {
 	if (!(only_save_windows && buf->b_nwindows == 0)
 		&& !(buf->b_help && !(ssop_flags & SSOP_HELP))
@@ -11110,8 +11318,10 @@ makeopens(
 	 * resized when moving between windows.
 	 * Do this before restoring the view, so that the topline and the
 	 * cursor can be set.  This is done again below.
+	 * winminheight and winminwidth need to be set to avoid an error if the
+	 * user has set winheight or winwidth.
 	 */
-	if (put_line(fd, "set winheight=1 winwidth=1") == FAIL)
+	if (put_line(fd, "set winminheight=1 winheight=1 winminwidth=1 winwidth=1") == FAIL)
 	    return FAIL;
 	if (nr > 1 && ses_winsizes(fd, restore_size, tab_firstwin) == FAIL)
 	    return FAIL;
@@ -11180,6 +11390,10 @@ makeopens(
     /* Re-apply 'winheight', 'winwidth' and 'shortmess'. */
     if (fprintf(fd, "set winheight=%ld winwidth=%ld shortmess=%s",
 			       p_wh, p_wiw, p_shm) < 0 || put_eol(fd) == FAIL)
+	return FAIL;
+    /* Re-apply 'winminheight' and 'winminwidth'. */
+    if (fprintf(fd, "set winminheight=%ld winminwidth=%ld",
+				      p_wmh, p_wmw) < 0 || put_eol(fd) == FAIL)
 	return FAIL;
 
     /*
@@ -11849,6 +12063,18 @@ get_behave_arg(expand_T *xp UNUSED, int idx)
 	return (char_u *)"mswin";
     if (idx == 1)
 	return (char_u *)"xterm";
+    return NULL;
+}
+
+/*
+ * Function given to ExpandGeneric() to obtain the possible arguments of the
+ * ":messages {clear}" command.
+ */
+    char_u *
+get_messages_arg(expand_T *xp UNUSED, int idx)
+{
+    if (idx == 0)
+	return (char_u *)"clear";
     return NULL;
 }
 #endif

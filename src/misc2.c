@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -403,7 +403,7 @@ incl(pos_T *lp)
     int
 dec_cursor(void)
 {
- return dec(&curwin->w_cursor);
+    return dec(&curwin->w_cursor);
 }
 
     int
@@ -502,6 +502,28 @@ get_cursor_rel_lnum(
 	retval = lnum - cursor;
 
     return retval;
+}
+
+/*
+ * Make sure "pos.lnum" and "pos.col" are valid in "buf".
+ * This allows for the col to be on the NUL byte.
+ */
+    void
+check_pos(buf_T *buf, pos_T *pos)
+{
+    char_u *line;
+    colnr_T len;
+
+    if (pos->lnum > buf->b_ml.ml_line_count)
+	pos->lnum = buf->b_ml.ml_line_count;
+
+    if (pos->col > 0)
+    {
+	line = ml_get_buf(buf, pos->lnum, FALSE);
+	len = (colnr_T)STRLEN(line);
+	if (pos->col > len)
+	    pos->col = len;
+    }
 }
 
 /*
@@ -896,7 +918,7 @@ lalloc(long_u size, int message)
     {
 	/* Don't hide this message */
 	emsg_silent = 0;
-	EMSGN(_("E341: Internal error: lalloc(%ld, )"), size);
+	IEMSGN(_("E341: Internal error: lalloc(%ld, )"), size);
 	return NULL;
     }
 
@@ -1053,7 +1075,7 @@ free_all_mem(void)
     p_ea = FALSE;
     if (first_tabpage->tp_next != NULL)
 	do_cmdline_cmd((char_u *)"tabonly!");
-    if (firstwin != lastwin)
+    if (!ONE_WINDOW)
 	do_cmdline_cmd((char_u *)"only!");
 # endif
 
@@ -1217,11 +1239,18 @@ free_all_mem(void)
 	if (delete_first_msg() == FAIL)
 	    break;
 
+# ifdef FEAT_JOB_CHANNEL
+    channel_free_all();
+# endif
+#ifdef FEAT_TIMERS
+    timer_free_all();
+#endif
 # ifdef FEAT_EVAL
+    /* must be after channel_free_all() with unrefs partials */
     eval_clear();
 # endif
 # ifdef FEAT_JOB_CHANNEL
-    channel_free_all();
+    /* must be after eval_clear() with unrefs jobs */
     job_free_all();
 # endif
 
@@ -1391,7 +1420,7 @@ vim_strsave_shellescape(char_u *string, int do_special, int do_newline)
     length = (unsigned)STRLEN(string) + 3;  /* two quotes and a trailing NUL */
     for (p = string; *p != NUL; mb_ptr_adv(p))
     {
-# if defined(WIN32) || defined(DOS)
+# ifdef WIN32
 	if (!p_ssl)
 	{
 	    if (*p == '"')
@@ -1422,7 +1451,7 @@ vim_strsave_shellescape(char_u *string, int do_special, int do_newline)
 	d = escaped_string;
 
 	/* add opening quote */
-# if defined(WIN32) || defined(DOS)
+# ifdef WIN32
 	if (!p_ssl)
 	    *d++ = '"';
 	else
@@ -1431,7 +1460,7 @@ vim_strsave_shellescape(char_u *string, int do_special, int do_newline)
 
 	for (p = string; *p != NUL; )
 	{
-# if defined(WIN32) || defined(DOS)
+# ifdef WIN32
 	    if (!p_ssl)
 	    {
 		if (*p == '"')
@@ -1474,7 +1503,7 @@ vim_strsave_shellescape(char_u *string, int do_special, int do_newline)
 	}
 
 	/* add terminating quote and finish with a NUL */
-# if defined(WIN32) || defined(DOS)
+# ifdef WIN32
 	if (!p_ssl)
 	    *d++ = '"';
 	else
@@ -1573,7 +1602,10 @@ strup_save(char_u *orig)
 		{
 		    s = alloc((unsigned)STRLEN(res) + 1 + newl - l);
 		    if (s == NULL)
-			break;
+		    {
+			vim_free(res);
+			return NULL;
+		    }
 		    mch_memmove(s, res, p - res);
 		    STRCPY(s + (p - res) + newl, p + l);
 		    p = s + (p - res);
@@ -1590,6 +1622,69 @@ strup_save(char_u *orig)
 # endif
 	    {
 		*p = TOUPPER_LOC(*p); /* note that toupper() can be a macro */
+		p++;
+	    }
+	}
+
+    return res;
+}
+
+/*
+ * Make string "s" all lower-case and return it in allocated memory.
+ * Handles multi-byte characters as well as possible.
+ * Returns NULL when out of memory.
+ */
+    char_u *
+strlow_save(char_u *orig)
+{
+    char_u	*p;
+    char_u	*res;
+
+    res = p = vim_strsave(orig);
+
+    if (res != NULL)
+	while (*p != NUL)
+	{
+# ifdef FEAT_MBYTE
+	    int		l;
+
+	    if (enc_utf8)
+	    {
+		int	c, lc;
+		int	newl;
+		char_u	*s;
+
+		c = utf_ptr2char(p);
+		lc = utf_tolower(c);
+
+		/* Reallocate string when byte count changes.  This is rare,
+		 * thus it's OK to do another malloc()/free(). */
+		l = utf_ptr2len(p);
+		newl = utf_char2len(lc);
+		if (newl != l)
+		{
+		    s = alloc((unsigned)STRLEN(res) + 1 + newl - l);
+		    if (s == NULL)
+		    {
+			vim_free(res);
+			return NULL;
+		    }
+		    mch_memmove(s, res, p - res);
+		    STRCPY(s + (p - res) + newl, p + l);
+		    p = s + (p - res);
+		    vim_free(res);
+		    res = s;
+		}
+
+		utf_char2bytes(lc, p);
+		p += newl;
+	    }
+	    else if (has_mbyte && (l = (*mb_ptr2len)(p)) > 1)
+		p += l;		/* skip multi-byte character */
+	    else
+# endif
+	    {
+		*p = TOLOWER_LOC(*p); /* note that tolower() can be a macro */
 		p++;
 	    }
 	}
@@ -1624,7 +1719,7 @@ vim_strncpy(char_u *to, char_u *from, size_t len)
 
 /*
  * Like strcat(), but make sure the result fits in "tosize" bytes and is
- * always NUL terminated.
+ * always NUL terminated. "from" and "to" may overlap.
  */
     void
 vim_strcat(char_u *to, char_u *from, size_t tosize)
@@ -1638,7 +1733,7 @@ vim_strcat(char_u *to, char_u *from, size_t tosize)
 	to[tosize - 1] = NUL;
     }
     else
-	STRCPY(to + tolen, from);
+	mch_memmove(to + tolen, from, fromlen + 1);
 }
 
 /*
@@ -1708,55 +1803,6 @@ vim_memset(void *ptr, int c, size_t size)
     while (size-- > 0)
 	*p++ = c;
     return ptr;
-}
-#endif
-
-#ifdef VIM_MEMCMP
-/*
- * Return zero when "b1" and "b2" are the same for "len" bytes.
- * Return non-zero otherwise.
- */
-    int
-vim_memcmp(void *b1, void *b2, size_t len)
-{
-    char_u  *p1 = (char_u *)b1, *p2 = (char_u *)b2;
-
-    for ( ; len > 0; --len)
-    {
-	if (*p1 != *p2)
-	    return 1;
-	++p1;
-	++p2;
-    }
-    return 0;
-}
-#endif
-
-/* skipped when generating prototypes, the prototype is in vim.h */
-#ifdef VIM_MEMMOVE
-/*
- * Version of memmove() that handles overlapping source and destination.
- * For systems that don't have a function that is guaranteed to do that (SYSV).
- */
-    void
-mch_memmove(void *src_arg, void *dst_arg, size_t len)
-{
-    /*
-     * A void doesn't have a size, we use char pointers.
-     */
-    char *dst = dst_arg, *src = src_arg;
-
-					/* overlap, copy backwards */
-    if (dst > src && dst < src + len)
-    {
-	src += len;
-	dst += len;
-	while (len-- > 0)
-	    *--dst = *--src;
-    }
-    else				/* copy forwards */
-	while (len-- > 0)
-	    *dst++ = *src++;
 }
 #endif
 
@@ -2154,6 +2200,7 @@ static struct modmasktable
     /* 'A' must be the last one */
     {MOD_MASK_ALT,		MOD_MASK_ALT,		(char_u)'A'},
     {0, 0, NUL}
+    /* NOTE: when adding an entry, update MAX_KEY_NAME_LEN! */
 };
 
 /*
@@ -2286,6 +2333,8 @@ static struct key_name_entry
     {K_XDOWN,		(char_u *)"xDown"},
     {K_XLEFT,		(char_u *)"xLeft"},
     {K_XRIGHT,		(char_u *)"xRight"},
+    {K_PS,		(char_u *)"PasteStart"},
+    {K_PE,		(char_u *)"PasteEnd"},
 
     {K_F1,		(char_u *)"F1"},
     {K_F2,		(char_u *)"F2"},
@@ -2421,6 +2470,7 @@ static struct key_name_entry
     {K_PLUG,		(char_u *)"Plug"},
     {K_CURSORHOLD,	(char_u *)"CursorHold"},
     {0,			NULL}
+    /* NOTE: When adding a long name update MAX_KEY_NAME_LEN. */
 };
 
 #define KEY_NAMES_TABLE_LEN (sizeof(key_names_table) / sizeof(struct key_name_entry))
@@ -2649,8 +2699,13 @@ get_special_key_name(int c, int modifiers)
     }
     else		/* use name of special key */
     {
-	STRCPY(string + idx, key_names_table[table_idx].name);
-	idx = (int)STRLEN(string);
+	size_t len = STRLEN(key_names_table[table_idx].name);
+
+	if (len + idx + 2 <= MAX_KEY_NAME_LEN)
+	{
+	    STRCPY(string + idx, key_names_table[table_idx].name);
+	    idx += (int)len;
+	}
     }
     string[idx++] = '>';
     string[idx] = NUL;
@@ -2667,13 +2722,14 @@ get_special_key_name(int c, int modifiers)
 trans_special(
     char_u	**srcp,
     char_u	*dst,
-    int		keycode) /* prefer key code, e.g. K_DEL instead of DEL */
+    int		keycode, /* prefer key code, e.g. K_DEL instead of DEL */
+    int		in_string) /* TRUE when inside a double quoted string */
 {
     int		modifiers = 0;
     int		key;
     int		dlen = 0;
 
-    key = find_special_key(srcp, &modifiers, keycode, FALSE);
+    key = find_special_key(srcp, &modifiers, keycode, FALSE, in_string);
     if (key == 0)
 	return 0;
 
@@ -2713,7 +2769,8 @@ find_special_key(
     char_u	**srcp,
     int		*modp,
     int		keycode,     /* prefer key code, e.g. K_DEL instead of DEL */
-    int		keep_x_key)  /* don't translate xHome to Home key */
+    int		keep_x_key,  /* don't translate xHome to Home key */
+    int		in_string)   /* TRUE in string, double quote is escaped */
 {
     char_u	*last_dash;
     char_u	*end_of_name;
@@ -2744,10 +2801,14 @@ find_special_key(
 		else
 #endif
 		    l = 1;
-		/* Anything accepted, like <C-?>, except <C-">, because the "
-		 * ends the string. */
-		if (bp[l] != '"' && bp[l + 1] == '>')
+		/* Anything accepted, like <C-?>.
+		 * <C-"> or <M-"> are not special in strings as " is
+		 * the string delimiter. With a backslash it works: <M-\"> */
+		if (!(in_string && bp[1] == '"') && bp[2] == '>')
 		    bp += l;
+		else if (in_string && bp[1] == '\\' && bp[2] == '"'
+							       && bp[3] == '>')
+		    bp += 2;
 	    }
 	}
 	if (bp[0] == 't' && bp[1] == '_' && bp[2] && bp[3])
@@ -2791,20 +2852,22 @@ find_special_key(
 	    }
 	    else
 	    {
-		/*
-		 * Modifier with single letter, or special key name.
-		 */
+		int off = 1;
+
+		/* Modifier with single letter, or special key name.  */
+		if (in_string && last_dash[1] == '\\' && last_dash[2] == '"')
+		    off = 2;
 #ifdef FEAT_MBYTE
 		if (has_mbyte)
-		    l = mb_ptr2len(last_dash + 1);
+		    l = mb_ptr2len(last_dash + off);
 		else
 #endif
 		    l = 1;
-		if (modifiers != 0 && last_dash[l + 1] == '>')
-		    key = PTR2CHAR(last_dash + 1);
+		if (modifiers != 0 && last_dash[l + off] == '>')
+		    key = PTR2CHAR(last_dash + off);
 		else
 		{
-		    key = get_special_key_code(last_dash + 1);
+		    key = get_special_key_code(last_dash + off);
 		    if (!keep_x_key)
 			key = handle_x_keys(key);
 		}
@@ -6003,32 +6066,6 @@ filewritable(char_u *fname)
 }
 #endif
 
-/*
- * Print an error message with one or two "%s" and one or two string arguments.
- * This is not in message.c to avoid a warning for prototypes.
- */
-    int
-emsg3(char_u *s, char_u *a1, char_u *a2)
-{
-    if (emsg_not_now())
-	return TRUE;		/* no error messages at the moment */
-    vim_snprintf((char *)IObuff, IOSIZE, (char *)s, a1, a2);
-    return emsg(IObuff);
-}
-
-/*
- * Print an error message with one "%ld" and one long int argument.
- * This is not in message.c to avoid a warning for prototypes.
- */
-    int
-emsgn(char_u *s, long n)
-{
-    if (emsg_not_now())
-	return TRUE;		/* no error messages at the moment */
-    vim_snprintf((char *)IObuff, IOSIZE, (char *)s, n);
-    return emsg(IObuff);
-}
-
 #if defined(FEAT_SPELL) || defined(FEAT_PERSISTENT_UNDO) || defined(PROTO)
 /*
  * Read 2 bytes from "fd" and turn them into an int, MSB first.
@@ -6219,6 +6256,7 @@ has_non_ascii(char_u *s)
 #if defined(MESSAGE_QUEUE) || defined(PROTO)
 /*
  * Process messages that have been queued for netbeans or clientserver.
+ * Also check if any jobs have ended.
  * These functions can call arbitrary vimscript and should only be called when
  * it is safe to do so.
  */
@@ -6250,4 +6288,34 @@ parse_queued_messages(void)
     job_check_ended();
 # endif
 }
+#endif
+
+#ifndef PROTO  /* proto is defined in vim.h */
+# ifdef ELAPSED_TIMEVAL
+/*
+ * Return time in msec since "start_tv".
+ */
+    long
+elapsed(struct timeval *start_tv)
+{
+    struct timeval  now_tv;
+
+    gettimeofday(&now_tv, NULL);
+    return (now_tv.tv_sec - start_tv->tv_sec) * 1000L
+	 + (now_tv.tv_usec - start_tv->tv_usec) / 1000L;
+}
+# endif
+
+# ifdef ELAPSED_TICKCOUNT
+/*
+ * Return time in msec since "start_tick".
+ */
+    long
+elapsed(DWORD start_tick)
+{
+    DWORD	now = GetTickCount();
+
+    return (long)now - (long)start_tick;
+}
+# endif
 #endif

@@ -88,7 +88,7 @@ func RunServer(cmd, testfunc, args)
 
     call call(function(a:testfunc), [port])
   catch
-    call assert_false(1, "Caught exception: " . v:exception)
+    call assert_false(1, 'Caught exception: "' . v:exception . '" in ' . v:throwpoint)
   finally
     call s:kill_server(a:cmd)
   endtry
@@ -109,14 +109,102 @@ func s:kill_server(cmd)
 endfunc
 
 " Wait for up to a second for "expr" to become true.
+" Return time slept in milliseconds.  With the +reltime feature this can be
+" more than the actual waiting time.  Without +reltime it can also be less.
 func WaitFor(expr)
+  " using reltime() is more accurate, but not always available
+  if has('reltime')
+    let start = reltime()
+  else
+    let slept = 0
+  endif
   for i in range(100)
     try
       if eval(a:expr)
-	return
+	if has('reltime')
+	  return float2nr(reltimefloat(reltime(start)) * 1000)
+	endif
+	return slept
       endif
     catch
     endtry
+    if !has('reltime')
+      let slept += 10
+    endif
     sleep 10m
   endfor
+  return 1000
+endfunc
+
+" Wait for up to a given milliseconds.
+" With the +timers feature this waits for key-input by getchar(), Resume()
+" feeds key-input and resumes process. Return time waited in milliseconds.
+" Without +timers it uses simply :sleep.
+func Standby(msec)
+  if has('timers')
+    let start = reltime()
+    let g:_standby_timer = timer_start(a:msec, function('s:feedkeys'))
+    call getchar()
+    return float2nr(reltimefloat(reltime(start)) * 1000)
+  else
+    execute 'sleep ' a:msec . 'm'
+    return a:msec
+  endif
+endfunc
+
+func Resume()
+  if exists('g:_standby_timer')
+    call timer_stop(g:_standby_timer)
+    call s:feedkeys(0)
+    unlet g:_standby_timer
+  endif
+endfunc
+
+func s:feedkeys(timer)
+  call feedkeys('x', 'nt')
+endfunc
+
+" Run Vim, using the "vimcmd" file and "-u NORC".
+" "before" is a list of Vim commands to be executed before loading plugins.
+" "after" is a list of Vim commands to be executed after loading plugins.
+" Plugins are not loaded, unless 'loadplugins' is set in "before".
+" Return 1 if Vim could be executed.
+func RunVim(before, after, arguments)
+  return RunVimPiped(a:before, a:after, a:arguments, '')
+endfunc
+
+func RunVimPiped(before, after, arguments, pipecmd)
+  if !filereadable('vimcmd')
+    return 0
+  endif
+  let args = ''
+  if len(a:before) > 0
+    call writefile(a:before, 'Xbefore.vim')
+    let args .= ' --cmd "so Xbefore.vim"'
+  endif
+  if len(a:after) > 0
+    call writefile(a:after, 'Xafter.vim')
+    let args .= ' -S Xafter.vim'
+  endif
+
+  let cmd = readfile('vimcmd')[0]
+  let cmd = substitute(cmd, '-u \f\+', '-u NONE', '')
+  if cmd !~ '-u NONE'
+    let cmd = cmd . ' -u NONE'
+  endif
+
+  " With pipecmd we can't set VIMRUNTIME.
+  if a:pipecmd != ''
+    let cmd = substitute(cmd, 'VIMRUNTIME=.*VIMRUNTIME;', '', '')
+  endif
+
+  exe "silent !" . a:pipecmd . cmd . args . ' ' . a:arguments
+
+  if len(a:before) > 0
+    call delete('Xbefore.vim')
+  endif
+  if len(a:after) > 0
+    call delete('Xafter.vim')
+  endif
+  return 1
 endfunc

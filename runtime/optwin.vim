@@ -1,7 +1,7 @@
 " These commands create the option window.
 "
 " Maintainer:	Bram Moolenaar <Bram@vim.org>
-" Last Change:	2016 Apr 30
+" Last Change:	2016 Aug 21
 
 " If there already is an option window, jump to that one.
 if bufwinnr("option-window") > 0
@@ -923,7 +923,7 @@ if has("folding")
   call append("$", "foldmarker\tmarkers used when 'foldmethod' is \"marker\"")
   call append("$", "\t(local to window)")
   call <SID>OptionL("fmr")
-  call append("$", "foldnestmax\tmaximum fold depth for when 'foldmethod is \"indent\" or \"syntax\"")
+  call append("$", "foldnestmax\tmaximum fold depth for when 'foldmethod' is \"indent\" or \"syntax\"")
   call append("$", "\t(local to window)")
   call <SID>OptionL("fdn")
 endif
@@ -1203,8 +1203,8 @@ endif
 if has("langmap")
   call append("$", "langmap\tlist of characters that are translated in Normal mode")
   call <SID>OptionG("lmap", &lmap)
-  call append("$", "langnoremap\tdon't apply 'langmap' to mapped characters")
-  call <SID>BinOptionG("lnr", &lnr)
+  call append("$", "langremap\tapply 'langmap' to mapped characters")
+  call <SID>BinOptionG("lrm", &lrm)
 endif
 if has("xim")
   call append("$", "imdisable\twhen set never use IM; overrules following IM options")
@@ -1307,6 +1307,11 @@ call append("$", "\t(local to buffer)")
 call <SID>BinOptionL("bl")
 call append("$", "debug\tset to \"msg\" to see all error messages")
 call append("$", " \tset debug=" . &debug)
+if has("signs")
+  call append("$", "signcolumn\twhether to show the signcolumn")
+  call append("$", "\t(local to window)")
+  call <SID>OptionL("scl")
+endif
 if has("mzscheme")
   call append("$", "mzquantum\tinterval in milliseconds between polls for MzScheme threads")
   call append("$", " \tset mzq=" . &mzq)
@@ -1318,6 +1323,10 @@ endif
 if exists("&perldll")
   call append("$", "perldll\tname of the Perl dynamic library")
   call <SID>OptionG("perldll", &perldll)
+endif
+if has('pythonx')
+  call append("$", "pyxversion\twhether to use Python 2 or 3")
+  call append("$", " \tset pyx=" . &wd)
 endif
 if exists("&pythondll")
   call append("$", "pythondll\tname of the Python 2 dynamic library")

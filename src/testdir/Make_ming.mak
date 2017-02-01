@@ -48,27 +48,27 @@ $(SCRIPTS) $(SCRIPTS_GUI) $(SCRIPTS_WIN32) $(NEW_TESTS): $(SCRIPTS_FIRST)
 .SUFFIXES: .in .out .res .vim
 
 vimall:	fixff $(SCRIPTS_FIRST) $(SCRIPTS) $(SCRIPTS_GUI) $(SCRIPTS_WIN32) newtests
-	echo ALL DONE
+	@echo ALL DONE
 
 nongui:	fixff nolog $(SCRIPTS_FIRST) $(SCRIPTS) newtests
-	echo ALL DONE
+	@echo ALL DONE
 
 benchmark: $(SCRIPTS_BENCH)
 
 small: nolog
-	echo ALL DONE
+	@echo ALL DONE
 
 gui:	fixff nolog $(SCRIPTS_FIRST) $(SCRIPTS) $(SCRIPTS_GUI) newtests
-	echo ALL DONE
+	@echo ALL DONE
 
 win32:	fixff nolog $(SCRIPTS_FIRST) $(SCRIPTS) $(SCRIPTS_WIN32) newtests
-	echo ALL DONE
+	@echo ALL DONE
 
 # TODO: find a way to avoid changing the distributed files.
 fixff:
 	-$(VIMPROG) -u dos.vim $(NO_PLUGIN) "+argdo set ff=dos|upd" +q *.in *.ok
 	-$(VIMPROG) -u dos.vim $(NO_PLUGIN) "+argdo set ff=unix|upd" +q \
-		dotest.in test60.ok test71.ok test74.ok test_listchars.ok \
+		dotest.in test60.ok test_listchars.ok \
 		test_getcwd.ok test_wordcount.ok
 
 clean:
@@ -117,5 +117,7 @@ bench_re_freeze.out: bench_re_freeze.vim
 newtests: $(NEW_TESTS)
 
 .vim.res:
+	@echo "$(VIMPROG)" > vimcmd
 	$(VIMPROG) -u NONE $(NO_PLUGIN) -S runtest.vim $*.vim
+	@$(DEL) vimcmd
 

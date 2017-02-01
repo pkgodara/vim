@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -90,6 +90,11 @@ static char *(main_errors[]) =
 
 static char_u *start_dir = NULL;	/* current working dir on startup */
 
+static int has_dash_c_arg = FALSE;
+
+/* Various parameters passed between main() and other functions. */
+static mparm_T	params;
+
     int
 # ifdef VIMDLL
 _export
@@ -104,9 +109,6 @@ main
 # endif
 (int argc, char **argv)
 {
-    char_u	*fname = NULL;		/* file name from command line */
-    mparm_T	params;			/* various parameters passed between
-					 * main() and other functions. */
 #ifdef STARTUPTIME
     int		i;
 #endif
@@ -155,6 +157,7 @@ main
 #endif
 
 #ifdef STARTUPTIME
+    /* Need to find "--startuptime" before actually parsing arguments. */
     for (i = 1; i < argc; ++i)
     {
 	if (STRICMP(argv[i], "--startuptime") == 0 && i + 1 < argc)
@@ -239,7 +242,7 @@ main
 		mch_chdir((char *)start_dir);
 	}
 #endif
-	fname = alist_name(&GARGLIST[0]);
+	params.fname = alist_name(&GARGLIST[0]);
     }
 
 #if defined(WIN32) && defined(FEAT_MBYTE)
@@ -261,7 +264,7 @@ main
 	 * Hint: to avoid this when typing a command use a forward slash.
 	 * If the cd fails, it doesn't matter.
 	 */
-	(void)vim_chdirfile(fname);
+	(void)vim_chdirfile(params.fname);
 	if (start_dir != NULL)
 	    mch_dirname(start_dir, MAXPATHL);
     }
@@ -279,7 +282,7 @@ main
     /*
      * When listing swap file names, don't do cursor positioning et. al.
      */
-    if (recoverymode && fname == NULL)
+    if (recoverymode && params.fname == NULL)
 	params.want_full_screen = FALSE;
 
     /*
@@ -310,8 +313,8 @@ main
 	if (getcwd((char *)NameBuff, MAXPATHL) != NULL
 						&& STRCMP(NameBuff, "/") == 0)
 	{
-	    if (fname != NULL)
-		(void)vim_chdirfile(fname);
+	    if (params.fname != NULL)
+		(void)vim_chdirfile(params.fname);
 	    else
 	    {
 		expand_env((char_u *)"$HOME", NameBuff, MAXPATHL);
@@ -405,38 +408,30 @@ main
      * Newer version of MzScheme (Racket) require earlier (trampolined)
      * initialisation via scheme_main_setup.
      * Implement this by initialising it as early as possible
-     * and splitting off remaining Vim main into vim_main2
+     * and splitting off remaining Vim main into vim_main2().
      */
-    {
-	/* Pack up preprocessed command line arguments.
-	 * It is safe because Scheme does not access argc/argv. */
-	char *args[2];
-	args[0] = (char *)fname;
-	args[1] = (char *)&params;
-	return mzscheme_main(2, args);
-    }
-}
+    return mzscheme_main();
+#else
+    return vim_main2();
 #endif
+}
 #endif /* NO_VIM_MAIN */
+#endif /* PROTO */
 
-/* vim_main2() needs to be produced when FEAT_MZSCHEME is defined even when
- * NO_VIM_MAIN is defined. */
-#ifdef FEAT_MZSCHEME
+/*
+ * vim_main2() is needed for FEAT_MZSCHEME, but we define it always to keep
+ * things simple.
+ * It is also defined when NO_VIM_MAIN is defined, but then it's empty.
+ */
     int
-vim_main2(int argc UNUSED, char **argv UNUSED)
+vim_main2(void)
 {
-# ifndef NO_VIM_MAIN
-    char_u	*fname = (char_u *)argv[0];
-    mparm_T	params;
-
-    memcpy(&params, argv[1], sizeof(params));
-# else
-    return 0;
-}
-# endif
-#endif
-
 #ifndef NO_VIM_MAIN
+    /* Reset 'loadplugins' for "-u NONE" before "--cmd" arguments.
+     * Allows for setting 'loadplugins' there. */
+    if (params.use_vimrc != NULL && STRCMP(params.use_vimrc, "NONE") == 0)
+	p_lpl = FALSE;
+
     /* Execute --cmd arguments. */
     exe_pre_commands(&params);
 
@@ -451,14 +446,22 @@ vim_main2(int argc UNUSED, char **argv UNUSED)
     if (p_lpl)
     {
 # ifdef VMS	/* Somehow VMS doesn't handle the "**". */
-	source_runtime((char_u *)"plugin/*.vim", DIP_ALL);
+	source_runtime((char_u *)"plugin/*.vim", DIP_ALL | DIP_NOAFTER);
 # else
-	source_runtime((char_u *)"plugin/**/*.vim", DIP_ALL);
+	source_runtime((char_u *)"plugin/**/*.vim", DIP_ALL | DIP_NOAFTER);
 # endif
 	TIME_MSG("loading plugins");
 
 	ex_packloadall(NULL);
 	TIME_MSG("loading packages");
+
+# ifdef VMS	/* Somehow VMS doesn't handle the "**". */
+	source_runtime((char_u *)"plugin/*.vim", DIP_ALL | DIP_AFTER);
+# else
+	source_runtime((char_u *)"plugin/**/*.vim", DIP_ALL | DIP_AFTER);
+# endif
+	TIME_MSG("loading after plugins");
+
     }
 #endif
 
@@ -478,7 +481,7 @@ vim_main2(int argc UNUSED, char **argv UNUSED)
      * This uses the 'dir' option, therefore it must be after the
      * initializations.
      */
-    if (recoverymode && fname == NULL)
+    if (recoverymode && params.fname == NULL)
     {
 	recover_names(NULL, TRUE, 0, NULL);
 	mch_exit(0);
@@ -742,7 +745,7 @@ vim_main2(int argc UNUSED, char **argv UNUSED)
 	win_T	*wp;
 
 	/* set options in each window for "vimdiff". */
-	for (wp = firstwin; wp != NULL; wp = wp->w_next)
+	FOR_ALL_WINDOWS(wp)
 	    diff_win_options(wp, TRUE);
     }
 #endif
@@ -873,16 +876,16 @@ vim_main2(int argc UNUSED, char **argv UNUSED)
     */
     main_loop(FALSE, FALSE);
 
+#endif /* NO_VIM_MAIN */
+
     return 0;
 }
-#endif /* NO_VIM_MAIN */
-#endif /* PROTO */
 
 /*
  * Initialisation shared by main() and some tests.
  */
     void
-common_init(mparm_T *params)
+common_init(mparm_T *paramp)
 {
 
 #ifdef FEAT_MBYTE
@@ -899,7 +902,7 @@ common_init(mparm_T *params)
 #ifdef MAC_OS_CLASSIC
     /* Prepare for possibly starting GUI sometime */
     /* Macintosh needs this before any memory is allocated. */
-    gui_prepare(&params->argc, params->argv);
+    gui_prepare(&paramp->argc, paramp->argv);
     TIME_MSG("GUI prepared");
 #endif
 
@@ -948,14 +951,14 @@ common_init(mparm_T *params)
      *   --socketid
      *   --windowid
      */
-    early_arg_scan(params);
+    early_arg_scan(paramp);
 
 #ifdef FEAT_SUN_WORKSHOP
-    findYourself(params->argv[0]);
+    findYourself(paramp->argv[0]);
 #endif
 #if defined(FEAT_GUI) && !defined(MAC_OS_CLASSIC)
     /* Prepare for possibly starting GUI sometime */
-    gui_prepare(&params->argc, params->argv);
+    gui_prepare(&paramp->argc, paramp->argv);
     TIME_MSG("GUI prepared");
 #endif
 
@@ -970,7 +973,7 @@ common_init(mparm_T *params)
      * (needed for :! to * work). mch_check_win() will also handle the -d or
      * -dev argument.
      */
-    params->stdout_isatty = (mch_check_win(params->argc, params->argv) != FAIL);
+    stdout_isatty = (mch_check_win(paramp->argc, paramp->argv) != FAIL);
     TIME_MSG("window checked");
 
     /*
@@ -1375,8 +1378,7 @@ getout(int exitval)
 	for (tp = first_tabpage; tp != NULL; tp = next_tp)
 	{
 	    next_tp = tp->tp_next;
-	    for (wp = (tp == curtab)
-		    ? firstwin : tp->tp_firstwin; wp != NULL; wp = wp->w_next)
+	    FOR_ALL_WINDOWS_IN_TAB(tp, wp)
 	    {
 		if (wp->w_buffer == NULL)
 		    /* Autocmd must have close the buffer already, skip. */
@@ -1399,7 +1401,7 @@ getout(int exitval)
 # endif
 
 	/* Trigger BufUnload for buffers that are loaded */
-	for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+	FOR_ALL_BUFFERS(buf)
 	    if (buf->b_ml.ml_mfp != NULL)
 	    {
 		bufref_T bufref;
@@ -1826,6 +1828,7 @@ command_line_scan(mparm_T *parmp)
 				/* "--literal" take files literally */
 				/* "--nofork" don't fork */
 				/* "--not-a-term" don't warn for not a term */
+				/* "--ttyfail" exit if not a term */
 				/* "--noplugin[s]" skip plugins */
 				/* "--cmd <cmd>" execute cmd before vimrc */
 		if (STRICMP(argv[0] + argv_idx, "help") == 0)
@@ -1855,6 +1858,8 @@ command_line_scan(mparm_T *parmp)
 		    p_lpl = FALSE;
 		else if (STRNICMP(argv[0] + argv_idx, "not-a-term", 10) == 0)
 		    parmp->not_a_term = TRUE;
+		else if (STRNICMP(argv[0] + argv_idx, "ttyfail", 7) == 0)
+		    parmp->tty_fail = TRUE;
 		else if (STRNICMP(argv[0] + argv_idx, "cmd", 3) == 0)
 		{
 		    want_argument = TRUE;
@@ -1929,6 +1934,7 @@ command_line_scan(mparm_T *parmp)
 
 	    case 'C':		/* "-C"  Compatible */
 		change_compatible(TRUE);
+		has_dash_c_arg = TRUE;
 		break;
 
 	    case 'e':		/* "-e" Ex mode */
@@ -2486,7 +2492,7 @@ check_tty(mparm_T *parmp)
 	if (!input_isatty)
 	    silent_mode = TRUE;
     }
-    else if (parmp->want_full_screen && (!parmp->stdout_isatty || !input_isatty)
+    else if (parmp->want_full_screen && (!stdout_isatty || !input_isatty)
 #ifdef FEAT_GUI
 	    /* don't want the delay when started from the desktop */
 	    && !gui.starting
@@ -2501,7 +2507,7 @@ check_tty(mparm_T *parmp)
 	 * input buffer so fast I can't even kill the process in under 2
 	 * minutes (and it beeps continuously the whole time :-)
 	 */
-	if (netbeans_active() && (!parmp->stdout_isatty || !input_isatty))
+	if (netbeans_active() && (!stdout_isatty || !input_isatty))
 	{
 	    mch_errmsg(_("Vim: Error: Failure to start gvim from NetBeans\n"));
 	    exit(1);
@@ -2514,11 +2520,13 @@ check_tty(mparm_T *parmp)
 	    exit(1);
 	}
 #endif
-	if (!parmp->stdout_isatty)
+	if (!stdout_isatty)
 	    mch_errmsg(_("Vim: Warning: Output is not to a terminal\n"));
 	if (!input_isatty)
 	    mch_errmsg(_("Vim: Warning: Input is not from a terminal\n"));
 	out_flush();
+	if (parmp->tty_fail && (!stdout_isatty || !input_isatty))
+	    exit(1);
 	if (scriptin[0] == NULL)
 	    ui_delay(2000L, TRUE);
 	TIME_MSG("Warning delay");
@@ -2943,8 +2951,6 @@ source_startup_scripts(mparm_T *parmp)
 	    if (use_gvimrc == NULL)	    /* don't load gvimrc either */
 		use_gvimrc = parmp->use_vimrc;
 #endif
-	    if (parmp->use_vimrc[2] == 'N')
-		p_lpl = FALSE;		    /* don't load plugins either */
 	}
 	else
 	{
@@ -2998,11 +3004,14 @@ source_startup_scripts(mparm_T *parmp)
 							   DOSO_VIMRC) == FAIL
 #endif
 		&& process_env((char_u *)"EXINIT", FALSE) == FAIL
-		&& do_source((char_u *)USR_EXRC_FILE, FALSE, DOSO_NONE) == FAIL)
-	    {
+		&& do_source((char_u *)USR_EXRC_FILE, FALSE, DOSO_NONE) == FAIL
 #ifdef USR_EXRC_FILE2
-		(void)do_source((char_u *)USR_EXRC_FILE2, FALSE, DOSO_NONE);
+		&& do_source((char_u *)USR_EXRC_FILE2, FALSE, DOSO_NONE) == FAIL
 #endif
+		&& !has_dash_c_arg)
+	    {
+		/* When no .vimrc file was found: source defaults.vim. */
+		do_source((char_u *)VIM_DEFAULTS_FILE, FALSE, DOSO_NONE);
 	    }
 	}
 
@@ -3010,7 +3019,7 @@ source_startup_scripts(mparm_T *parmp)
 	 * Read initialization commands from ".vimrc" or ".exrc" in current
 	 * directory.  This is only done if the 'exrc' option is set.
 	 * Because of security reasons we disallow shell and write commands
-	 * now, except for unix if the file is owned by the user or 'secure'
+	 * now, except for Unix if the file is owned by the user or 'secure'
 	 * option has been reset in environment of global ".exrc" or ".vimrc".
 	 * Only do this if VIMRC_FILE is not the same as USR_VIMRC_FILE or
 	 * SYS_VIMRC_FILE.
@@ -3283,6 +3292,7 @@ usage(void)
 #endif
     main_msg(_("-T <terminal>\tSet terminal type to <terminal>"));
     main_msg(_("--not-a-term\t\tSkip warning for input/output not being a terminal"));
+    main_msg(_("--ttyfail\t\tExit if input or output is not a terminal"));
     main_msg(_("-u <vimrc>\t\tUse <vimrc> instead of any .vimrc"));
 #ifdef FEAT_GUI
     main_msg(_("-U <gvimrc>\t\tUse <gvimrc> instead of any .gvimrc"));

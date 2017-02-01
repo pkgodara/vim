@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -1286,6 +1286,7 @@ ex_perldo(exarg_T *eap)
     SV		*sv;
     char	*str;
     linenr_T	i;
+    buf_T	*was_curbuf = curbuf;
 
     if (bufempty())
 	return;
@@ -1321,11 +1322,14 @@ ex_perldo(exarg_T *eap)
     SAVETMPS;
     for (i = eap->line1; i <= eap->line2; i++)
     {
+	/* Check the line number, the command my have deleted lines. */
+	if (i > curbuf->b_ml.ml_line_count)
+	    break;
 	sv_setpv(GvSV(PL_defgv), (char *)ml_get(i));
 	PUSHMARK(sp);
 	perl_call_pv("VIM::perldo", G_SCALAR | G_EVAL);
 	str = SvPV(GvSV(PL_errgv), length);
-	if (length)
+	if (length || curbuf != was_curbuf)
 	    break;
 	SPAGAIN;
 	if (SvTRUEx(POPs))
@@ -1534,14 +1538,14 @@ Buffers(...)
 	if (GIMME == G_SCALAR)
 	{
 	    i = 0;
-	    for (vimbuf = firstbuf; vimbuf; vimbuf = vimbuf->b_next)
+	    FOR_ALL_BUFFERS(vimbuf)
 		++i;
 
 	    XPUSHs(sv_2mortal(newSViv(i)));
 	}
 	else
 	{
-	    for (vimbuf = firstbuf; vimbuf; vimbuf = vimbuf->b_next)
+	    FOR_ALL_BUFFERS(vimbuf)
 		XPUSHs(newBUFrv(newSV(0), vimbuf));
 	}
     }
@@ -1586,7 +1590,7 @@ Windows(...)
 	    XPUSHs(sv_2mortal(newSViv(win_count())));
 	else
 	{
-	    for (vimwin = firstwin; vimwin != NULL; vimwin = W_NEXT(vimwin))
+	    FOR_ALL_WINDOWS(vimwin)
 		XPUSHs(newWINrv(newSV(0), vimwin));
 	}
     }

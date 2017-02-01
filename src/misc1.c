@@ -1,4 +1,4 @@
-/* vi:set ts=8 sts=4 sw=4:
+/* vi:set ts=8 sts=4 sw=4 noet:
  *
  * VIM - Vi IMproved	by Bram Moolenaar
  *
@@ -2177,16 +2177,19 @@ ins_bytes_len(char_u *p, int len)
     void
 ins_char(int c)
 {
-#if defined(FEAT_MBYTE) || defined(PROTO)
     char_u	buf[MB_MAXBYTES + 1];
-    int		n;
+    int		n = 1;
 
+#ifdef FEAT_MBYTE
     n = (*mb_char2bytes)(c, buf);
 
     /* When "c" is 0x100, 0x200, etc. we don't want to insert a NUL byte.
      * Happens for CTRL-Vu9900. */
     if (buf[0] == 0)
 	buf[0] = '\n';
+#else
+    buf[0] = c;
+#endif
 
     ins_char_bytes(buf, n);
 }
@@ -2195,7 +2198,6 @@ ins_char(int c)
 ins_char_bytes(char_u *buf, int charlen)
 {
     int		c = buf[0];
-#endif
     int		newlen;		/* nr of bytes inserted */
     int		oldlen;		/* nr of bytes deleted (0 when not replacing) */
     char_u	*p;
@@ -2218,11 +2220,7 @@ ins_char_bytes(char_u *buf, int charlen)
 
     /* The lengths default to the values for when not replacing. */
     oldlen = 0;
-#ifdef FEAT_MBYTE
     newlen = charlen;
-#else
-    newlen = 1;
-#endif
 
     if (State & REPLACE_FLAG)
     {
@@ -2814,7 +2812,7 @@ changed_bytes(linenr_T lnum, colnr_T col)
 	win_T	    *wp;
 	linenr_T    wlnum;
 
-	for (wp = firstwin; wp != NULL; wp = wp->w_next)
+	FOR_ALL_WINDOWS(wp)
 	    if (wp->w_p_diff && wp != curwin)
 	    {
 		redraw_win_later(wp, VALID);
@@ -2924,7 +2922,7 @@ changed_lines(
 	win_T	    *wp;
 	linenr_T    wlnum;
 
-	for (wp = firstwin; wp != NULL; wp = wp->w_next)
+	FOR_ALL_WINDOWS(wp)
 	    if (wp->w_p_diff && wp != curwin)
 	    {
 		redraw_win_later(wp, VALID);
@@ -3213,7 +3211,7 @@ check_status(buf_T *buf)
 {
     win_T	*wp;
 
-    for (wp = firstwin; wp != NULL; wp = wp->w_next)
+    FOR_ALL_WINDOWS(wp)
 	if (wp->w_buffer == buf && wp->w_status_height)
 	{
 	    wp->w_redr_status = TRUE;
@@ -3416,7 +3414,7 @@ get_keystroke(void)
 	if (n > 0)
 	{
 	    /* Replace zero and CSI by a special key code. */
-	    n = fix_input_buffer(buf + len, n, FALSE);
+	    n = fix_input_buffer(buf + len, n);
 	    len += n;
 	    waited = 0;
 	}
@@ -4455,6 +4453,9 @@ vim_setenv(char_u *name, char_u *val)
     {
 	sprintf((char *)envbuf, "%s=%s", name, val);
 	putenv((char *)envbuf);
+# ifdef libintl_putenv
+	libintl_putenv((char *)envbuf);
+# endif
     }
 #endif
 #ifdef FEAT_GETTEXT
@@ -5422,7 +5423,6 @@ static int	skip_label(linenr_T, char_u **pp);
 static int	cin_first_id_amount(void);
 static int	cin_get_equal_amount(linenr_T lnum);
 static int	cin_ispreproc(char_u *);
-static int	cin_ispreproc_cont(char_u **pp, linenr_T *lnump);
 static int	cin_iscomment(char_u *);
 static int	cin_islinecomment(char_u *);
 static int	cin_isterminated(char_u *, int, int);
@@ -5762,6 +5762,7 @@ cin_is_cpp_namespace(char_u *s)
 {
     char_u	*p;
     int		has_name = FALSE;
+    int		has_name_start = FALSE;
 
     s = cin_skipcomment(s);
     if (STRNCMP(s, "namespace", 9) == 0 && (s[9] == NUL || !vim_iswordc(s[9])))
@@ -5780,9 +5781,17 @@ cin_is_cpp_namespace(char_u *s)
 	    }
 	    else if (vim_iswordc(*p))
 	    {
+		has_name_start = TRUE;
 		if (has_name)
 		    return FALSE; /* word character after skipping past name */
 		++p;
+	    }
+	    else if (p[0] == ':' && p[1] == ':' && vim_iswordc(p[2]))
+	    {
+		if (!has_name_start || has_name)
+		    return FALSE;
+		/* C++ 17 nested namespace */
+		p += 3;
 	    }
 	    else
 	    {
@@ -5993,13 +6002,18 @@ cin_ispreproc(char_u *s)
  * Return TRUE if line "*pp" at "*lnump" is a preprocessor statement or a
  * continuation line of a preprocessor statement.  Decrease "*lnump" to the
  * start and return the line in "*pp".
+ * Put the amount of indent in "*amount".
  */
     static int
-cin_ispreproc_cont(char_u **pp, linenr_T *lnump)
+cin_ispreproc_cont(char_u **pp, linenr_T *lnump, int *amount)
 {
     char_u	*line = *pp;
     linenr_T	lnum = *lnump;
     int		retval = FALSE;
+    int		candidate_amount = *amount;
+
+    if (*line != NUL && line[STRLEN(line) - 1] == '\\')
+	candidate_amount = get_indent_lnum(lnum);
 
     for (;;)
     {
@@ -6018,6 +6032,8 @@ cin_ispreproc_cont(char_u **pp, linenr_T *lnump)
 
     if (lnum != *lnump)
 	*pp = ml_get(*lnump);
+    if (retval)
+	*amount = candidate_amount;
     return retval;
 }
 
@@ -6097,7 +6113,7 @@ cin_isterminated(
  * When a line ends in a comma we continue looking in the next line.
  * "sp" points to a string with the line.  When looking at other lines it must
  * be restored to the line.  When it's NULL fetch lines here.
- * "lnum" is where we start looking.
+ * "first_lnum" is where we start looking.
  * "min_lnum" is the line before which we will not be looking.
  */
     static int
@@ -6108,6 +6124,7 @@ cin_isfuncdecl(
 {
     char_u	*s;
     linenr_T	lnum = first_lnum;
+    linenr_T	save_lnum = curwin->w_cursor.lnum;
     int		retval = FALSE;
     pos_T	*trypos;
     int		just_started = TRUE;
@@ -6117,15 +6134,20 @@ cin_isfuncdecl(
     else
 	s = *sp;
 
+    curwin->w_cursor.lnum = lnum;
     if (find_last_paren(s, '(', ')')
 	&& (trypos = find_match_paren(curbuf->b_ind_maxparen)) != NULL)
     {
 	lnum = trypos->lnum;
 	if (lnum < min_lnum)
+	{
+	    curwin->w_cursor.lnum = save_lnum;
 	    return FALSE;
+	}
 
 	s = ml_get(lnum);
     }
+    curwin->w_cursor.lnum = save_lnum;
 
     /* Ignore line starting with #. */
     if (cin_ispreproc(s))
@@ -6681,7 +6703,7 @@ find_start_brace(void)	    /* XXX */
     static pos_T *
 find_match_paren(int ind_maxparen)	/* XXX */
 {
- return find_match_char('(', ind_maxparen);
+    return find_match_char('(', ind_maxparen);
 }
 
     static pos_T *
@@ -7375,7 +7397,7 @@ get_c_indent(void)
 		l = skipwhite(ml_get(lnum));
 		if (cin_nocode(l))		/* skip comment lines */
 		    continue;
-		if (cin_ispreproc_cont(&l, &lnum))
+		if (cin_ispreproc_cont(&l, &lnum, &amount))
 		    continue;			/* ignore #define, #if, etc. */
 		curwin->w_cursor.lnum = lnum;
 
@@ -7788,10 +7810,10 @@ get_c_indent(void)
 		 */
 		if (curwin->w_cursor.lnum <= ourscope)
 		{
-		    /* we reached end of scope:
-		     * if looking for a enum or structure initialization
+		    /* We reached end of scope:
+		     * If looking for a enum or structure initialization
 		     * go further back:
-		     * if it is an initializer (enum xxx or xxx =), then
+		     * If it is an initializer (enum xxx or xxx =), then
 		     * don't add ind_continuation, otherwise it is a variable
 		     * declaration:
 		     * int x,
@@ -7830,7 +7852,8 @@ get_c_indent(void)
 			/*
 			 * Skip preprocessor directives and blank lines.
 			 */
-			if (cin_ispreproc_cont(&l, &curwin->w_cursor.lnum))
+			if (cin_ispreproc_cont(&l, &curwin->w_cursor.lnum,
+								    &amount))
 			    continue;
 
 			if (cin_nocode(l))
@@ -7947,7 +7970,8 @@ get_c_indent(void)
 			    }
 
 			    /* Skip preprocessor directives and blank lines. */
-			    if (cin_ispreproc_cont(&l, &curwin->w_cursor.lnum))
+			    if (cin_ispreproc_cont(&l, &curwin->w_cursor.lnum,
+								    &amount))
 				continue;
 
 			    /* Finally the actual check for "namespace". */
@@ -8123,7 +8147,7 @@ get_c_indent(void)
 		 * unlocked it)
 		 */
 		l = ml_get_curline();
-		if (cin_ispreproc_cont(&l, &curwin->w_cursor.lnum)
+		if (cin_ispreproc_cont(&l, &curwin->w_cursor.lnum, &amount)
 							     || cin_nocode(l))
 		    continue;
 
@@ -8844,7 +8868,7 @@ term_again:
 	/*
 	 * Skip preprocessor directives and blank lines.
 	 */
-	if (cin_ispreproc_cont(&l, &curwin->w_cursor.lnum))
+	if (cin_ispreproc_cont(&l, &curwin->w_cursor.lnum, &amount))
 	    continue;
 
 	if (cin_nocode(l))
@@ -8945,7 +8969,7 @@ term_again:
 	    {
 		look = ml_get(--curwin->w_cursor.lnum);
 		if (!(cin_nocode(look) || cin_ispreproc_cont(
-				      &look, &curwin->w_cursor.lnum)))
+				      &look, &curwin->w_cursor.lnum, &amount)))
 		    break;
 	    }
 	    if (curwin->w_cursor.lnum > 0
@@ -9444,10 +9468,7 @@ prepare_to_exit(void)
 	 * screen (if there are two screens).
 	 */
 	settmode(TMODE_COOK);
-#ifdef WIN3264
-	if (can_end_termcap_mode(FALSE) == TRUE)
-#endif
-	    stoptermcap();
+	stoptermcap();
 	out_flush();
     }
 }
@@ -9475,7 +9496,7 @@ preserve_exit(void)
 
     ml_close_notmod();		    /* close all not-modified buffers */
 
-    for (buf = firstbuf; buf != NULL; buf = buf->b_next)
+    FOR_ALL_BUFFERS(buf)
     {
 	if (buf->b_ml.ml_mfp != NULL && buf->b_ml.ml_mfp->mf_fname != NULL)
 	{
@@ -10514,18 +10535,34 @@ uniquefy_paths(garray_T *gap, char_u *pattern)
 	/* Shorten the filename while maintaining its uniqueness */
 	path_cutoff = get_path_cutoff(path, &path_ga);
 
-	/* we start at the end of the path */
-	pathsep_p = path + len - 1;
+	/* Don't assume all files can be reached without path when search
+	 * pattern starts with star star slash, so only remove path_cutoff
+	 * when possible. */
+	if (pattern[0] == '*' && pattern[1] == '*'
+		&& vim_ispathsep_nocolon(pattern[2])
+		&& path_cutoff != NULL
+		&& vim_regexec(&regmatch, path_cutoff, (colnr_T)0)
+		&& is_unique(path_cutoff, gap, i))
+	{
+	    sort_again = TRUE;
+	    mch_memmove(path, path_cutoff, STRLEN(path_cutoff) + 1);
+	}
+	else
+	{
+	    /* Here all files can be reached without path, so get shortest
+	     * unique path.  We start at the end of the path. */
+	    pathsep_p = path + len - 1;
 
-	while (find_previous_pathsep(path, &pathsep_p))
-	    if (vim_regexec(&regmatch, pathsep_p + 1, (colnr_T)0)
-		    && is_unique(pathsep_p + 1, gap, i)
-		    && path_cutoff != NULL && pathsep_p + 1 >= path_cutoff)
-	    {
-		sort_again = TRUE;
-		mch_memmove(path, pathsep_p + 1, STRLEN(pathsep_p));
-		break;
-	    }
+	    while (find_previous_pathsep(path, &pathsep_p))
+		if (vim_regexec(&regmatch, pathsep_p + 1, (colnr_T)0)
+			&& is_unique(pathsep_p + 1, gap, i)
+			&& path_cutoff != NULL && pathsep_p + 1 >= path_cutoff)
+		{
+		    sort_again = TRUE;
+		    mch_memmove(path, pathsep_p + 1, STRLEN(pathsep_p));
+		    break;
+		}
+	}
 
 	if (mch_isFullName(path))
 	{
